@@ -30,26 +30,29 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse
-
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit.errors import StreamlitSecretNotFoundError
+
 import os
 
 def load_aws_secrets_into_env():
     try:
-        secrets = st.secrets  # may raise if no secrets file
-    except StreamlitSecretNotFoundError:
-        return  # no secrets locally; rely on env vars / ~/.aws/credentials
+        secrets = st.secrets  # may raise in some Streamlit setups
+        # Try touching it to force parsing:
+        _ = list(secrets.keys()) if hasattr(secrets, "keys") else None
+    except Exception:
+        # No secrets available locally / in this env
+        return
 
-    # if secrets exist, map them to env vars
     if "AWS_ACCESS_KEY_ID" in secrets and "AWS_SECRET_ACCESS_KEY" in secrets:
         os.environ["AWS_ACCESS_KEY_ID"] = secrets["AWS_ACCESS_KEY_ID"]
         os.environ["AWS_SECRET_ACCESS_KEY"] = secrets["AWS_SECRET_ACCESS_KEY"]
         os.environ["AWS_DEFAULT_REGION"] = secrets.get("AWS_DEFAULT_REGION", "ap-south-1")
         if "AWS_SESSION_TOKEN" in secrets:
             os.environ["AWS_SESSION_TOKEN"] = secrets["AWS_SESSION_TOKEN"]
+
+load_aws_secrets_into_env()
 
 load_aws_secrets_into_env()
 
