@@ -35,6 +35,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+if "AWS_ACCESS_KEY_ID" in st.secrets:
+    os.environ["AWS_ACCESS_KEY_ID"] = st.secrets["AWS_ACCESS_KEY_ID"]
+    os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
+    os.environ["AWS_DEFAULT_REGION"] = st.secrets.get("AWS_DEFAULT_REGION", "ap-south-1")
+    if "AWS_SESSION_TOKEN" in st.secrets:
+        os.environ["AWS_SESSION_TOKEN"] = st.secrets["AWS_SESSION_TOKEN"]
+        
 # Plotly is optional but recommended for a better demo
 try:
     import plotly.express as px
@@ -51,14 +58,7 @@ try:
 except Exception:
     _HAS_S3 = False
 
-import os, streamlit as st
 
-if "AWS_ACCESS_KEY_ID" in st.secrets:
-    os.environ["AWS_ACCESS_KEY_ID"] = st.secrets["AWS_ACCESS_KEY_ID"]
-    os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
-    os.environ["AWS_DEFAULT_REGION"] = st.secrets.get("AWS_DEFAULT_REGION", "ap-south-1")
-    if "AWS_SESSION_TOKEN" in st.secrets:
-        os.environ["AWS_SESSION_TOKEN"] = st.secrets["AWS_SESSION_TOKEN"]
 
 # ----------------------------
 # Utilities
