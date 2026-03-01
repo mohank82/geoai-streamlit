@@ -34,6 +34,8 @@ from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
+import os
 
 def load_aws_secrets_into_env():
     try:
