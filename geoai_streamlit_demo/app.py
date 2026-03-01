@@ -126,6 +126,10 @@ def _require_s3():
         st.error("Missing S3 dependencies. Install: pip install boto3 s3fs")
         st.stop()
 
+def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # keep first occurrence of duplicate column names
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
 @st.cache_resource
 def _s3_client(region_name: str):
     _require_s3()
@@ -266,6 +270,7 @@ def load_features_frozen(region: str, features_prefix_uri: str) -> pd.DataFrame:
     dfs = [s3_read_parquet(f) for f in files]
     df = pd.concat(dfs, ignore_index=True)
     df = ensure_columns(df, {"county_name": "county", "County": "county", "YEAR": "year", "Year": "year"})
+    df = dedupe_columns(df)
     if "county" in df.columns:
         df["county_norm"] = df["county"].map(normalize_county_name)
     if "year" in df.columns:
@@ -372,6 +377,7 @@ def _load_all():
         dfp, dbg = load_predictions_for_season(region, bucket, state_fips, county_fips, s, run_date, m)
         dfp = ensure_columns(dfp, {"pred": "prediction", "Predicted": "prediction", "yhat": "prediction"})
         dfp = ensure_columns(dfp, {"county_name": "county", "County": "county"})
+        dfp = dedupe_columns(dfp)
         if "county" in dfp.columns:
             dfp["county_norm"] = dfp["county"].map(normalize_county_name)
         if "year" in dfp.columns:
@@ -623,26 +629,43 @@ with tab_drivers:
                     driver_cols = st.multiselect("Pick numeric driver columns", options=numeric_cols, default=numeric_cols[:6])
 
                 dsmall = drivers[join_cols + driver_cols].copy()
-                j = p.merge(dsmall, on=join_cols, how="inner").dropna(subset=["prediction"])
-                if j.empty:
-                    st.warning("No overlap between predictions and frozen features (check keys).")
-                else:
-                    st.markdown("#### Driver correlation with prediction")
-                    corr_rows = []
-                    for c in driver_cols:
-                        if c in j.columns and pd.api.types.is_numeric_dtype(j[c]):
-                            corr_rows.append({"driver": c, "corr_with_pred": float(j[c].corr(j["prediction"]))})
-                    corr_df = pd.DataFrame(corr_rows).sort_values("corr_with_pred", ascending=False)
-                    st.dataframe(corr_df, use_container_width=True)
+                #j = p.merge(dsmall, on=join_cols, how="inner").dropna(subset=["prediction"])
+                p = dedupe_columns(p)
+                dsmall = dedupe_columns(dsmall)
 
-                    if _HAS_PLOTLY and len(driver_cols) > 0:
-                        driver_pick = st.selectbox("Scatter plot driver vs prediction", options=driver_cols, index=0)
-                        fig = px.scatter(
-                            j, x=driver_pick, y="prediction",
-                            hover_name="county_norm",
-                            title=f"{driver_pick} vs prediction ({season_sel}, {feature_year})"
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                missing_left = [c for c in join_cols if c not in p.columns]
+                missing_right = [c for c in join_cols if c not in dsmall.columns]
+
+                if missing_left or missing_right:
+                    st.warning(f"Driver join skipped. Missing keys. pred missing={missing_left}, features missing={missing_right}")
+                    st.stop()
+
+                try:
+                    j = p.merge(dsmall, on=join_cols, how="inner").dropna(subset=["prediction"])
+                    if j.empty:
+                        st.warning("No overlap between predictions and frozen features (check keys).")
+                    else:
+                        st.markdown("#### Driver correlation with prediction")
+                        corr_rows = []
+                        for c in driver_cols:
+                            if c in j.columns and pd.api.types.is_numeric_dtype(j[c]):
+                                corr_rows.append({"driver": c, "corr_with_pred": float(j[c].corr(j["prediction"]))})
+                        corr_df = pd.DataFrame(corr_rows).sort_values("corr_with_pred", ascending=False)
+                        st.dataframe(corr_df, use_container_width=True)
+
+                        if _HAS_PLOTLY and len(driver_cols) > 0:
+                            driver_pick = st.selectbox("Scatter plot driver vs prediction", options=driver_cols, index=0)
+                            fig = px.scatter(
+                                j, x=driver_pick, y="prediction",
+                                hover_name="county_norm",
+                                title=f"{driver_pick} vs prediction ({season_sel}, {feature_year})"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                except ValueError as e:
+                    st.warning(f"Driver join failed (likely duplicate join columns). Error: {e}")
+                    st.write("Pred duplicate columns:", list(p.columns[p.columns.duplicated()]))
+                    st.write("Feat duplicate columns:", list(dsmall.columns[dsmall.columns.duplicated()]))
+                    st.stop()                
 
 with tab_report:
     st.markdown("### Downloadable HTML report")
