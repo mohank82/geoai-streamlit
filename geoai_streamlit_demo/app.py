@@ -35,6 +35,22 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+def load_aws_secrets_into_env():
+    try:
+        secrets = st.secrets  # may raise if no secrets file
+    except StreamlitSecretNotFoundError:
+        return  # no secrets locally; rely on env vars / ~/.aws/credentials
+
+    # if secrets exist, map them to env vars
+    if "AWS_ACCESS_KEY_ID" in secrets and "AWS_SECRET_ACCESS_KEY" in secrets:
+        os.environ["AWS_ACCESS_KEY_ID"] = secrets["AWS_ACCESS_KEY_ID"]
+        os.environ["AWS_SECRET_ACCESS_KEY"] = secrets["AWS_SECRET_ACCESS_KEY"]
+        os.environ["AWS_DEFAULT_REGION"] = secrets.get("AWS_DEFAULT_REGION", "ap-south-1")
+        if "AWS_SESSION_TOKEN" in secrets:
+            os.environ["AWS_SESSION_TOKEN"] = secrets["AWS_SESSION_TOKEN"]
+
+load_aws_secrets_into_env()
+
 # Plotly is optional but recommended for a better demo
 try:
     import plotly.express as px
@@ -51,14 +67,7 @@ try:
 except Exception:
     _HAS_S3 = False
 
-import os, streamlit as st
 
-if "AWS_ACCESS_KEY_ID" in st.secrets:
-    os.environ["AWS_ACCESS_KEY_ID"] = st.secrets["AWS_ACCESS_KEY_ID"]
-    os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
-    os.environ["AWS_DEFAULT_REGION"] = st.secrets.get("AWS_DEFAULT_REGION", "ap-south-1")
-    if "AWS_SESSION_TOKEN" in st.secrets:
-        os.environ["AWS_SESSION_TOKEN"] = st.secrets["AWS_SESSION_TOKEN"]
 
 # ----------------------------
 # Utilities
