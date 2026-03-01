@@ -1,0 +1,8 @@
+streamlit>=1.34
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14
+boto3>=1.28
+s3fs>=2023.12
+plotly>=5.18
+statsmodels>=0.14
