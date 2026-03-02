@@ -2,8 +2,8 @@
 GeoAI Capstone Demo App (Streamlit) — Updated
 --------------------------------------------
 Updates requested by Mohan:
-1) Load predictions from:
-   s3://geoai-demo-data/features_frozen/state_fips=<state_fips>/county_fips=ALL/predict_year=<year>/
+1) Load predictions from your predictions outputs in S3, e.g.
+   s3://geoai-demo-data/predictions/state_fips=<state_fips>/county_fips=ALL/predict_year=<year>/feature_season=<season>/run_date=<run_date>/model=<model>/
    (supports parquet/csv; searches recursively for a prediction column)
 2) UI controls: County + Season + Model + Run date + Year range (2020–2025)
 3) "Observed vs Mean Prediction" line chart for 2020–2025 (like your screenshot, but simplified)
@@ -227,7 +227,7 @@ def _first_present(cols: List[str], candidates: List[str]) -> Optional[str]:
     return None
 
 @st.cache_data(show_spinner=False)
-def load_predictions_from_features_frozen(
+def load_predictions_from_predictions_s3(
     region: str,
     bucket: str,
     state_fips: str,
@@ -239,18 +239,32 @@ def load_predictions_from_features_frozen(
     county_fips: str = "ALL",
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Reads prediction rows from:
-      s3://<bucket>/features_frozen/state_fips=../county_fips=ALL/predict_year=<year>/
-    This function searches recursively for parquet/csv under that year prefix.
+    Reads prediction rows from your *predictions* folder structure, e.g.
 
-    If the dataset includes columns like feature_season/model_name/run_date, we filter them.
-    If those columns do NOT exist, we still attach the selected values as metadata.
+      s3://geoai-demo-data/predictions/
+        state_fips=19/
+        county_fips=ALL/
+        predict_year=2025/
+        feature_season=jun01/
+        run_date=2026-02-27/
+        model=Jun01_LightGBM-limited_withstorm/
+        predictions.csv
+
+    This function searches recursively for parquet/csv under the *exact* combination prefix.
+
+    Why you saw the error:
+    - The earlier app version was reading *features_frozen* (feature rows), not *predictions*.
+      Those files contain engineered features, so there is no prediction column.
     """
+    # Your S3 layout encodes selections in the path, including `model=<name>`.
     base_prefix = (
-        f"s3://{bucket}/features_frozen/"
+        f"s3://{bucket}/predictions/"
         f"state_fips={state_fips}/"
         f"county_fips={county_fips}/"
         f"predict_year={int(predict_year)}/"
+        f"feature_season={feature_season}/"
+        f"run_date={run_date}/"
+        f"model={model_name}/"
     )
 
     dbg = {
@@ -313,17 +327,10 @@ def load_predictions_from_features_frozen(
     if "county" in df.columns:
         df["county_norm"] = df["county"].map(normalize_county_name)
 
-    # attach / filter selection metadata
-    for c, val in [
-        ("feature_season", feature_season),
-        ("run_date", run_date),
-        ("model_name", model_name),
-    ]:
-        if c in df.columns:
-            # filter if column exists
-            df = df[df[c].astype(str) == str(val)]
-        else:
-            df[c] = val
+    # attach selection metadata for reporting
+    df["feature_season"] = feature_season
+    df["run_date"] = run_date
+    df["model_name"] = model_name
 
     return df, dbg
 
@@ -576,7 +583,7 @@ def _load_all_years(
     pred_all = []
     dbg_all = []
     for y in years:
-        d, dbg = load_predictions_from_features_frozen(
+        d, dbg = load_predictions_from_predictions_s3(
             region=region,
             bucket=bucket,
             state_fips=state_fips,
@@ -620,7 +627,7 @@ elif actuals_df is not None and "county_norm" in actuals_df.columns:
 if not county_options:
     st.warning(
         "Could not infer counties from predictions/actuals. "
-        "Your features_frozen outputs might be missing a 'county' or 'county_name' column. "
+        "Your prediction outputs might be missing a 'county' or 'county_name' column. "
         "If so, update your inference outputs to include county."
     )
     county_selected = None
@@ -682,7 +689,7 @@ with tab_main:
         st.info("Provide a State machine ARN in the sidebar to enable triggering.")
 
 with tab_debug:
-    st.markdown("### Debug info (what was searched under features_frozen)")
+    st.markdown("### Debug info (what was searched under predictions)")
     st.json(dbg_all)
     st.markdown("### Predictions preview")
     st.dataframe(pred_all.head(50), use_container_width=True)
@@ -771,3 +778,5 @@ with tab_valueadd:
             st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Actuals not available for these years; error view is disabled.")
+
+
