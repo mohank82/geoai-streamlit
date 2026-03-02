@@ -98,7 +98,9 @@ def normalize_county_name(x: str) -> str:
     if pd.isna(x):
         return x
     s = str(x).strip().lower()
-    return s.replace(" county", "")
+    s = s.replace(" county", "")
+    s = " ".join(s.split())  # collapse repeated whitespace
+    return s
 
 def ensure_columns(df: pd.DataFrame, rename_map: dict) -> pd.DataFrame:
     for k, v in rename_map.items():
@@ -345,10 +347,20 @@ def load_actuals(region: str, actuals_uri: str) -> pd.DataFrame:
         "YEAR": "year",
         "Year": "year",
     })
+
+    # --- normalize keys used for join ---
     if "county" in df.columns:
+        df["county"] = df["county"].astype(str)
         df["county_norm"] = df["county"].map(normalize_county_name)
+
     if "year" in df.columns:
-        df["year"] = df["year"].astype(int)
+        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+
+    # --- IMPORTANT: standardize observed yield column name for the dashboard ---
+    # Keep yield_bu_acre, but ALSO provide observed_yield
+    if "yield_bu_acre" in df.columns:
+        df["observed_yield"] = pd.to_numeric(df["yield_bu_acre"], errors="coerce")
+
     return df
 
 
@@ -375,15 +387,31 @@ def build_observed_vs_pred_series(
          .rename(columns={"prediction": "mean_prediction"})
     )
 
-    if actuals_df is not None and {"county_norm", "year", "yield_bu_acre"}.issubset(actuals_df.columns):
-        a = actuals_df[(actuals_df["county_norm"] == county_norm) & (actuals_df["year"].isin(years))][["year", "yield_bu_acre"]].copy()
-        a = a.rename(columns={"yield_bu_acre": "observed_yield"})
-        out = pd.merge(pred_series, a, on="year", how="left")
+    if actuals_df is not None and {"county_norm", "year"}.issubset(actuals_df.columns):
+        # prefer observed_yield if present; fall back to yield_bu_acre
+        obs_col = "observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre"
+        if obs_col in actuals_df.columns:
+            a = actuals_df[
+                (actuals_df["county_norm"] == county_norm) &
+                (actuals_df["year"].isin(years))
+            ][["year", obs_col]].copy()
+
+            a = a.rename(columns={obs_col: "observed_yield"})
+            # make sure numeric
+            a["observed_yield"] = pd.to_numeric(a["observed_yield"], errors="coerce")
+
+            out = pd.merge(pred_series, a, on="year", how="left")
+        else:
+            out = pred_series.copy()
+            out["observed_yield"] = np.nan
     else:
         out = pred_series.copy()
         out["observed_yield"] = np.nan
+    # final tidy
+    out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
+    out["mean_prediction"] = pd.to_numeric(out["mean_prediction"], errors="coerce")
+    out["observed_yield"] = pd.to_numeric(out["observed_yield"], errors="coerce")
 
-    out = out.sort_values("year")
     return out
 
 
@@ -646,6 +674,29 @@ with tab_main:
 
     series_df = build_observed_vs_pred_series(pred_all, actuals_df, county_selected, years)
     st.dataframe(series_df, use_container_width=True)
+    # Diagnostics: show which years are missing observed yields
+    missing_obs_years = series_df.loc[series_df["observed_yield"].isna(), "year"].tolist()
+
+    # Only warn for years <= 2024 (since 2025 observed is expected to be missing)
+    missing_obs_years = [int(y) for y in missing_obs_years if pd.notna(y) and int(y) <= 2024]
+
+    if missing_obs_years:
+        st.warning(
+            "Observed yield is missing for these years (likely a join key mismatch or gaps in actuals): "
+            + ", ".join(map(str, missing_obs_years))
+        )
+
+        # Extra debug: show what actuals has for this county across the selected years
+        if actuals_df is not None and "county_norm" in actuals_df.columns and "year" in actuals_df.columns:
+            obs_col = "observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre"
+            a_dbg = actuals_df[
+                (actuals_df["county_norm"] == county_selected) &
+                (actuals_df["year"].isin(years))
+            ][["county", "county_norm", "year", obs_col]].copy()
+
+            a_dbg = a_dbg.rename(columns={obs_col: "observed_yield"})
+            st.caption("Actuals rows found for this county in curated actuals.parquet (debug):")
+            st.dataframe(a_dbg.sort_values("year"), use_container_width=True)
 
     title = f"Observed vs Mean Prediction — {county_selected.title()} — {start_year}-{end_year}"
     if _HAS_PLOTLY:
