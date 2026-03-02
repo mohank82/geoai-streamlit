@@ -1,20 +1,16 @@
 """
-GeoAI Capstone Demo App (Streamlit)
------------------------------------
-This app is a Streamlit conversion of your `geoai_report_template.ipynb`.
+GeoAI Capstone Demo App (Streamlit) — Updated
+--------------------------------------------
+Updates requested by Mohan:
+1) Load predictions from:
+   s3://geoai-demo-data/features_frozen/state_fips=<state_fips>/county_fips=ALL/predict_year=<year>/
+   (supports parquet/csv; searches recursively for a prediction column)
+2) UI controls: County + Season + Model + Run date + Year range (2020–2025)
+3) "Observed vs Mean Prediction" line chart for 2020–2025 (like your screenshot, but simplified)
+4) Optional: Trigger an AWS Step Functions state machine for the selected (run_date, model, season)
+5) Download a PDF report (plot + table + (optional) metrics)
 
-What it does
-- Loads 2025 predictions from S3 (parquet/csv; headerless SageMaker CSV supported)
-- Optionally joins with curated actual yields (if available for the same year)
-- Produces "capstone-standard" visuals:
-  * Cutoff comparison (distribution + county ranking)
-  * Actual vs Predicted (if actuals exist)
-  * Error metrics table (RMSE, MAE, MAPE, R²) (if actuals exist)
-  * Interactive county table + top/bottom counties per cutoff
-  * Driver-signal exploration (NDVI/ERA5/Storm feature drivers) if frozen features are available
-- Generates a one-click HTML report you can download and share with professors.
-
-Run locally:
+Run:
   pip install -r requirements.txt
   streamlit run app.py
 
@@ -25,24 +21,63 @@ AWS Auth:
 
 from __future__ import annotations
 
+import io
 import os
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-import os
+# Optional (recommended)
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    _HAS_PLOTLY = True
+except Exception:
+    _HAS_PLOTLY = False
 
-def load_aws_secrets_into_env():
+# S3 + Step Functions
+try:
+    import boto3
+    import s3fs  # noqa: F401 (pandas uses it for s3://)
+    _HAS_AWS = True
+except Exception:
+    _HAS_AWS = False
+
+# PDF
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfgen import canvas
+    _HAS_PDF = True
+except Exception:
+    _HAS_PDF = False
+
+# Matplotlib just for exporting the plot image into the PDF
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:
+    _HAS_MPL = False
+
+
+# ----------------------------
+# Secrets helper (optional)
+# ----------------------------
+
+def load_aws_secrets_into_env() -> None:
+    """
+    Supports Streamlit Cloud / local secrets.
+    If st.secrets has AWS creds, export them into env vars so boto3/pandas+s3fs can use them.
+    """
     try:
-        secrets = st.secrets  # may raise in some Streamlit setups
-        # Try touching it to force parsing:
+        secrets = st.secrets
         _ = list(secrets.keys()) if hasattr(secrets, "keys") else None
     except Exception:
-        # No secrets available locally / in this env
         return
 
     if "AWS_ACCESS_KEY_ID" in secrets and "AWS_SECRET_ACCESS_KEY" in secrets:
@@ -53,32 +88,6 @@ def load_aws_secrets_into_env():
             os.environ["AWS_SESSION_TOKEN"] = secrets["AWS_SESSION_TOKEN"]
 
 load_aws_secrets_into_env()
-
-load_aws_secrets_into_env()
-
-if "AWS_ACCESS_KEY_ID" in st.secrets:
-    os.environ["AWS_ACCESS_KEY_ID"] = st.secrets["AWS_ACCESS_KEY_ID"]
-    os.environ["AWS_SECRET_ACCESS_KEY"] = st.secrets["AWS_SECRET_ACCESS_KEY"]
-    os.environ["AWS_DEFAULT_REGION"] = st.secrets.get("AWS_DEFAULT_REGION", "ap-south-1")
-    if "AWS_SESSION_TOKEN" in st.secrets:
-        os.environ["AWS_SESSION_TOKEN"] = st.secrets["AWS_SESSION_TOKEN"]
-        
-# Plotly is optional but recommended for a better demo
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    _HAS_PLOTLY = True
-except Exception:
-    _HAS_PLOTLY = False
-
-# S3 support
-try:
-    import boto3
-    import s3fs
-    _HAS_S3 = True
-except Exception:
-    _HAS_S3 = False
-
 
 
 # ----------------------------
@@ -96,6 +105,9 @@ def ensure_columns(df: pd.DataFrame, rename_map: dict) -> pd.DataFrame:
         if k in df.columns and v not in df.columns:
             df = df.rename(columns={k: v})
     return df
+
+def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[:, ~df.columns.duplicated()].copy()
 
 def metric_rmse(y_true, y_pred) -> float:
     y_true = np.asarray(y_true, dtype=float)
@@ -121,25 +133,31 @@ def metric_r2(y_true, y_pred) -> float:
     return float(1.0 - ss_res / ss_tot) if ss_tot != 0 else np.nan
 
 
-def _require_s3():
-    if not _HAS_S3:
-        st.error("Missing S3 dependencies. Install: pip install boto3 s3fs")
-        st.stop()
 
-def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # keep first occurrence of duplicate column names
-    return df.loc[:, ~df.columns.duplicated()].copy()
+def json_dumps(obj) -> str:
+    import json
+    return json.dumps(obj, separators=(",", ":"), default=str)
+
+def _require_aws():
+    if not _HAS_AWS:
+        st.error("Missing AWS deps. Install: pip install boto3 s3fs")
+        st.stop()
 
 @st.cache_resource
 def _s3_client(region_name: str):
-    _require_s3()
+    _require_aws()
     return boto3.client("s3", region_name=region_name)
+
+@st.cache_resource
+def _sf_client(region_name: str):
+    _require_aws()
+    return boto3.client("stepfunctions", region_name=region_name)
 
 def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".csv")) -> List[str]:
     """
     Returns full s3:// URIs for objects under the given s3:// prefix.
     """
-    _require_s3()
+    _require_aws()
     u = urlparse(prefix)
     if u.scheme != "s3":
         raise ValueError(f"Expected s3:// prefix, got: {prefix}")
@@ -167,79 +185,146 @@ def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".csv
 
 @st.cache_data(show_spinner=False)
 def s3_read_parquet(uri: str) -> pd.DataFrame:
-    _require_s3()
+    _require_aws()
     return pd.read_parquet(uri, engine="pyarrow")
 
 @st.cache_data(show_spinner=False)
 def s3_read_csv(uri: str, header: Optional[int] = "infer") -> pd.DataFrame:
-    _require_s3()
+    _require_aws()
     return pd.read_csv(uri, header=header)
 
-def _read_any_prediction_file(path_or_s3uri: str) -> pd.DataFrame:
+def _read_any_file(path_or_s3uri: str) -> pd.DataFrame:
     p = path_or_s3uri.lower()
     if p.endswith(".parquet"):
         return s3_read_parquet(path_or_s3uri)
     if p.endswith(".csv"):
-        # Try header first, then fallback to no-header
         try:
             df = s3_read_csv(path_or_s3uri, header="infer")
         except Exception:
             df = s3_read_csv(path_or_s3uri, header=None)
+        # handle 1-col output
         if df.shape[1] == 1:
             df.columns = ["prediction"]
         return df
     raise ValueError(f"Unsupported file type: {path_or_s3uri}")
 
+
+# ----------------------------
+# Loaders
+# ----------------------------
+
+PRED_COL_CANDIDATES = [
+    "prediction", "pred", "yhat", "y_pred", "predicted_yield", "mean_prediction", "mean_pred", "Predicted"
+]
+COUNTY_COL_CANDIDATES = ["county", "county_name", "County"]
+YEAR_COL_CANDIDATES = ["year", "YEAR", "Year", "predict_year"]
+
+def _first_present(cols: List[str], candidates: List[str]) -> Optional[str]:
+    setcols = set(cols)
+    for c in candidates:
+        if c in setcols:
+            return c
+    return None
+
 @st.cache_data(show_spinner=False)
-def load_predictions_for_season(
+def load_predictions_from_features_frozen(
     region: str,
     bucket: str,
     state_fips: str,
-    county_fips: str,
+    predict_year: int,
+    # these are selection filters; applied if columns exist or if the path contains them
     feature_season: str,
     run_date: str,
     model_name: str,
+    county_fips: str = "ALL",
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Loads predictions for a single cutoff season. Supports parquet or csv (headerless SageMaker CSV).
+    Reads prediction rows from:
+      s3://<bucket>/features_frozen/state_fips=../county_fips=ALL/predict_year=<year>/
+    This function searches recursively for parquet/csv under that year prefix.
+
+    If the dataset includes columns like feature_season/model_name/run_date, we filter them.
+    If those columns do NOT exist, we still attach the selected values as metadata.
     """
-    prefix = (
-        f"s3://{bucket}/predictions/"
+    base_prefix = (
+        f"s3://{bucket}/features_frozen/"
         f"state_fips={state_fips}/"
         f"county_fips={county_fips}/"
-        f"feature_season={feature_season}/"
-        f"run_date={run_date}/"
-        f"model={model_name}/"
+        f"predict_year={int(predict_year)}/"
     )
 
-    dbg = {"season": feature_season, "model": model_name, "prefix": prefix}
+    dbg = {
+        "base_prefix": base_prefix,
+        "feature_season": feature_season,
+        "run_date": run_date,
+        "model_name": model_name,
+    }
 
-    files = s3_list_files_under_prefix(region, prefix, exts=(".parquet", ".csv"))
-    if not files:
-        alt_prefix = prefix + "output/"
-        dbg["alt_prefix"] = alt_prefix
-        files = s3_list_files_under_prefix(region, alt_prefix, exts=(".parquet", ".csv"))
-        dbg["files_found_alt"] = len(files)
-
+    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".csv"))
     dbg["files_found"] = len(files)
     dbg["files_preview"] = files[:10]
 
     if not files:
-        raise FileNotFoundError(
-            f"No parquet/csv found under:\n  {prefix}\n(or)\n  {prefix}output/\n"
-            f"Verify your S3 prediction path."
-        )
+        raise FileNotFoundError(f"No parquet/csv found under: {base_prefix}")
 
     dfs = []
     for f in files:
-        dfs.append(_read_any_prediction_file(f))
+        try:
+            dfs.append(_read_any_file(f))
+        except Exception:
+            # Skip unreadable fragments rather than failing the whole demo
+            continue
+
+    if not dfs:
+        raise FileNotFoundError(f"Files exist but none were readable under: {base_prefix}")
 
     df = pd.concat(dfs, ignore_index=True)
-    if df.shape[1] == 1 and "prediction" not in df.columns:
-        df.columns = ["prediction"]
+    df = dedupe_columns(df)
 
-    df["feature_season"] = feature_season
-    df["model_name"] = model_name
+    # normalize key columns
+    pred_col = _first_present(list(df.columns), PRED_COL_CANDIDATES)
+    if pred_col and pred_col != "prediction":
+        df = df.rename(columns={pred_col: "prediction"})
+    if "prediction" not in df.columns:
+        # last-resort: if single numeric col, treat it as prediction
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if len(num_cols) == 1:
+            df = df.rename(columns={num_cols[0]: "prediction"})
+        else:
+            raise ValueError(
+                f"Could not find a prediction column. Expected one of {PRED_COL_CANDIDATES}. "
+                f"Found columns: {list(df.columns)[:40]}"
+            )
+
+    county_col = _first_present(list(df.columns), COUNTY_COL_CANDIDATES)
+    if county_col and county_col != "county":
+        df = df.rename(columns={county_col: "county"})
+
+    year_col = _first_present(list(df.columns), YEAR_COL_CANDIDATES)
+    if year_col and year_col != "year":
+        df = df.rename(columns={year_col: "year"})
+
+    # ensure year
+    if "year" not in df.columns:
+        df["year"] = int(predict_year)
+    df["year"] = df["year"].astype(int)
+
+    # ensure county_norm
+    if "county" in df.columns:
+        df["county_norm"] = df["county"].map(normalize_county_name)
+
+    # attach / filter selection metadata
+    for c, val in [
+        ("feature_season", feature_season),
+        ("run_date", run_date),
+        ("model_name", model_name),
+    ]:
+        if c in df.columns:
+            # filter if column exists
+            df = df[df[c].astype(str) == str(val)]
+        else:
+            df[c] = val
+
     return df, dbg
 
 @st.cache_data(show_spinner=False)
@@ -259,458 +344,430 @@ def load_actuals(region: str, actuals_uri: str) -> pd.DataFrame:
         df["year"] = df["year"].astype(int)
     return df
 
-@st.cache_data(show_spinner=False)
-def load_features_frozen(region: str, features_prefix_uri: str) -> pd.DataFrame:
-    """
-    Loads frozen features (parquet) under a prefix. Assumes features are stored as parquet files.
-    """
-    files = s3_list_files_under_prefix(region, features_prefix_uri, exts=(".parquet",))
-    if not files:
-        raise FileNotFoundError(f"No parquet features found under {features_prefix_uri}")
-    dfs = [s3_read_parquet(f) for f in files]
-    df = pd.concat(dfs, ignore_index=True)
-    df = ensure_columns(df, {"county_name": "county", "County": "county", "YEAR": "year", "Year": "year"})
-    df = dedupe_columns(df)
-    if "county" in df.columns:
-        df["county_norm"] = df["county"].map(normalize_county_name)
-    if "year" in df.columns:
-        df["year"] = df["year"].astype(int)
-    return df
-
 
 # ----------------------------
-# Report helpers
+# Plot helpers
 # ----------------------------
 
-def compute_metrics(merged: pd.DataFrame) -> pd.DataFrame:
+def build_observed_vs_pred_series(
+    pred_df: pd.DataFrame,
+    actuals_df: Optional[pd.DataFrame],
+    county_norm: str,
+    years: List[int],
+) -> pd.DataFrame:
     """
-    Expects columns: feature_season, yield_bu_acre, prediction
+    Returns a tidy DataFrame:
+      year, observed_yield, mean_prediction
     """
-    rows = []
-    for season, g in merged.groupby("feature_season"):
-        y = g["yield_bu_acre"].astype(float).values
-        p = g["prediction"].astype(float).values
-        rows.append({
-            "feature_season": season,
-            "n": len(g),
-            "RMSE": metric_rmse(y, p),
-            "MAE": metric_mae(y, p),
-            "MAPE_%": metric_mape(y, p),
-            "R2": metric_r2(y, p),
-        })
-    out = pd.DataFrame(rows).sort_values("feature_season")
+    p = pred_df[pred_df["county_norm"] == county_norm].copy() if "county_norm" in pred_df.columns else pred_df.copy()
+    p = p[p["year"].isin(years)]
+    pred_series = (
+        p.groupby("year")["prediction"]
+         .mean()
+         .reset_index()
+         .rename(columns={"prediction": "mean_prediction"})
+    )
+
+    if actuals_df is not None and {"county_norm", "year", "yield_bu_acre"}.issubset(actuals_df.columns):
+        a = actuals_df[(actuals_df["county_norm"] == county_norm) & (actuals_df["year"].isin(years))][["year", "yield_bu_acre"]].copy()
+        a = a.rename(columns={"yield_bu_acre": "observed_yield"})
+        out = pd.merge(pred_series, a, on="year", how="left")
+    else:
+        out = pred_series.copy()
+        out["observed_yield"] = np.nan
+
+    out = out.sort_values("year")
     return out
 
-def top_bottom(pred_all: pd.DataFrame, season: str, year: int, n: int = 10) -> pd.DataFrame:
-    d = pred_all[(pred_all["year"] == year) & (pred_all["feature_season"] == season)][["county_norm", "prediction"]].dropna()
-    top = d.sort_values("prediction", ascending=False).head(n).assign(rank="top")
-    bot = d.sort_values("prediction", ascending=True).head(n).assign(rank="bottom")
-    out = pd.concat([top, bot], ignore_index=True)
-    out["feature_season"] = season
-    return out
 
-def _plotly_or_fallback_warning():
-    if not _HAS_PLOTLY:
-        st.warning("Plotly is not installed. Install it for interactive charts: pip install plotly")
+def plot_observed_vs_pred_plotly(df: pd.DataFrame, title: str):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["year"], y=df["mean_prediction"], mode="lines+markers",
+        name="Mean Prediction"
+    ))
+    if df["observed_yield"].notna().any():
+        fig.add_trace(go.Scatter(
+            x=df["year"], y=df["observed_yield"], mode="lines+markers",
+            name="Observed Yield"
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Year",
+        yaxis_title="Yield (bu/acre)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
+
+
+def fig_to_png_bytes_matplotlib(df: pd.DataFrame, title: str) -> bytes:
+    """
+    For PDF export: render a clean plot with matplotlib and return PNG bytes.
+    """
+    if not _HAS_MPL:
+        raise RuntimeError("matplotlib is required for PDF export plot rendering.")
+
+    fig, ax = plt.subplots(figsize=(8.5, 3.7))
+    ax.plot(df["year"], df["mean_prediction"], marker="o", label="Mean Prediction")
+    if df["observed_yield"].notna().any():
+        ax.plot(df["year"], df["observed_yield"], marker="o", label="Observed Yield")
+    ax.set_title(title)
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Yield (bu/acre)")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend(loc="upper left")
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=200)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def build_pdf_report_bytes(
+    series_df: pd.DataFrame,
+    title: str,
+    params: Dict[str, str],
+    metrics: Optional[Dict[str, float]] = None,
+) -> bytes:
+    if not _HAS_PDF:
+        raise RuntimeError("reportlab is required for PDF export. Install: pip install reportlab")
+    if not _HAS_MPL:
+        raise RuntimeError("matplotlib is required for PDF export. Install: pip install matplotlib")
+
+    png = fig_to_png_bytes_matplotlib(series_df, title=title)
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    W, H = letter
+
+    y = H - 0.75 * inch
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(0.75 * inch, y, title)
+    y -= 0.35 * inch
+
+    c.setFont("Helvetica", 10)
+    for k, v in params.items():
+        c.drawString(0.75 * inch, y, f"{k}: {v}")
+        y -= 0.18 * inch
+
+    if metrics:
+        y -= 0.10 * inch
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(0.75 * inch, y, "Metrics (Observed vs Mean Prediction, overlapping years only)")
+        y -= 0.22 * inch
+        c.setFont("Helvetica", 10)
+        for k, v in metrics.items():
+            c.drawString(0.9 * inch, y, f"{k}: {v:.3f}" if isinstance(v, (float, int)) and not np.isnan(v) else f"{k}: N/A")
+            y -= 0.18 * inch
+
+    # plot image
+    y -= 0.15 * inch
+    img_w = W - 1.5 * inch
+    img_h = 3.2 * inch
+    img_x = 0.75 * inch
+    img_y = y - img_h
+    c.drawInlineImage(io.BytesIO(png), img_x, img_y, width=img_w, height=img_h)
+    y = img_y - 0.35 * inch
+
+    # data table
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(0.75 * inch, y, "Yearly values")
+    y -= 0.25 * inch
+    c.setFont("Helvetica", 10)
+    headers = ["Year", "Observed", "Mean Prediction"]
+    c.drawString(0.75 * inch, y, f"{headers[0]:<6} {headers[1]:>12} {headers[2]:>16}")
+    y -= 0.18 * inch
+    c.setFont("Helvetica", 10)
+    for _, row in series_df.iterrows():
+        yy = int(row["year"])
+        obs = row["observed_yield"]
+        pred = row["mean_prediction"]
+        obs_s = f"{obs:.1f}" if pd.notna(obs) else "NA"
+        pred_s = f"{pred:.1f}" if pd.notna(pred) else "NA"
+        c.drawString(0.75 * inch, y, f"{yy:<6} {obs_s:>12} {pred_s:>16}")
+        y -= 0.18 * inch
+        if y < 0.9 * inch:
+            c.showPage()
+            y = H - 0.75 * inch
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def compute_series_metrics(series_df: pd.DataFrame) -> Optional[Dict[str, float]]:
+    d = series_df.dropna(subset=["observed_yield", "mean_prediction"]).copy()
+    if len(d) < 2:
+        return None
+    y_true = d["observed_yield"].astype(float).values
+    y_pred = d["mean_prediction"].astype(float).values
+    return {
+        "RMSE": metric_rmse(y_true, y_pred),
+        "MAE": metric_mae(y_true, y_pred),
+        "MAPE_%": metric_mape(y_true, y_pred),
+        "R2": metric_r2(y_true, y_pred),
+    }
 
 
 # ----------------------------
 # Streamlit UI
 # ----------------------------
 
-st.set_page_config(page_title="GeoAI Yield Prediction Demo", layout="wide")
+st.set_page_config(page_title="GeoAI Yield Risk Demo", layout="wide")
 
-st.title("GeoAI Crop Yield Prediction — Capstone Demo")
-st.caption("Interactive report for model predictions (S3) + capstone-standard visuals (cutoff comparison, metrics, rankings, drivers).")
+st.title("GeoAI Yield Risk Detection — Demo Dashboard")
+st.caption("County-wise observed vs predicted yields (2020–2025) + Step Functions trigger + PDF export.")
 
 with st.sidebar:
-    st.header("Data & Run Settings")
+    st.header("Settings")
 
     region = st.text_input("AWS Region", value=os.getenv("AWS_REGION", "ap-south-1"))
     bucket = st.text_input("S3 Bucket", value=os.getenv("GEOAI_BUCKET", "geoai-demo-data"))
 
     state_fips = st.text_input("State FIPS", value=os.getenv("STATE_FIPS", "19"))
-    county_fips = st.text_input("County FIPS", value=os.getenv("COUNTY_FIPS", "ALL"))
+    county_fips = st.text_input("County FIPS (data partition)", value=os.getenv("COUNTY_FIPS", "ALL"))
 
-    run_date = st.text_input("Run date (run_date=...)", value=os.getenv("RUN_DATE", str(date.today())))
-
+    st.markdown("---")
+    st.subheader("Run selection")
+    run_date = st.text_input("run_date", value=os.getenv("RUN_DATE", str(date.today())))
     default_seasons = ["jun01", "jul01", "jul15", "aug01", "aug15"]
-    seasons = st.multiselect("Cutoff seasons", options=default_seasons, default=default_seasons)
+    feature_season = st.selectbox("Season (cutoff)", options=default_seasons, index=0)
+
+    model_name = st.text_input("Model name", value=os.getenv("MODEL_NAME", "Jun01_LightGBM-limited_withstorm"))
 
     st.markdown("---")
-    st.subheader("Model name per season")
-    st.caption("Must match: predictions/.../model=<model_name>/")
-
-    # Provide sane defaults matching your notebook; you can adjust in UI
-    model_defaults = {
-        "jun01": "Jun01_LightGBM-limited_withstorm",
-        "jul01": "Jul01_LightGBM-tuned_withoutstorm",
-        "jul15": "Jul15_LightGBM-limited_withstorm",
-        "aug01": "Aug01_LightGBM-limited_withstorm",
-        "aug15": "Aug15_LightGBM-limited_withstorm",
-    }
-    model_names: Dict[str, str] = {}
-    for s in seasons:
-        model_names[s] = st.text_input(f"model[{s}]", value=model_defaults.get(s, ""))
+    st.subheader("Years")
+    start_year = st.number_input("Start year", min_value=2010, max_value=2100, value=2020, step=1)
+    end_year = st.number_input("End year", min_value=2010, max_value=2100, value=2025, step=1)
+    years = list(range(int(start_year), int(end_year) + 1))
 
     st.markdown("---")
-    st.subheader("Actuals + Frozen Features (optional)")
-
+    st.subheader("Actuals (Observed yields)")
     actuals_uri_default = f"s3://{bucket}/curated/yield/state_fips={state_fips}/county_fips={county_fips}/actuals.parquet"
     actuals_uri = st.text_input("Actuals parquet URI", value=actuals_uri_default)
 
-    use_features = st.checkbox("Load frozen features (drivers)", value=True)
-    feature_year = st.number_input("Focus year", min_value=2000, max_value=2100, value=2025, step=1)
+    st.markdown("---")
+    load_btn = st.button("Load / Refresh", type="primary")
 
     st.markdown("---")
-    load_btn = st.button("Load / Refresh Data", type="primary")
-
-
-def _load_all():
-    # Predictions
-    pred_dfs = []
-    debug_info = []
-    for s in seasons:
-        m = model_names.get(s, "")
-        if not m:
-            continue
-        dfp, dbg = load_predictions_for_season(region, bucket, state_fips, county_fips, s, run_date, m)
-        dfp = ensure_columns(dfp, {"pred": "prediction", "Predicted": "prediction", "yhat": "prediction"})
-        dfp = ensure_columns(dfp, {"county_name": "county", "County": "county"})
-        dfp = dedupe_columns(dfp)
-        if "county" in dfp.columns:
-            dfp["county_norm"] = dfp["county"].map(normalize_county_name)
-        if "year" in dfp.columns:
-            dfp["year"] = dfp["year"].astype(int)
-        pred_dfs.append(dfp)
-        debug_info.append(dbg)
-
-    if not pred_dfs:
-        raise RuntimeError("No predictions loaded. Check seasons/model names and S3 paths.")
-
-    pred_all = pd.concat(pred_dfs, ignore_index=True)
-
-    # Some SageMaker outputs may not include county/year columns (single-column prediction).
-    # In that case, you must join back with a 'scoring manifest' / input order.
-    has_id_cols = ("county_norm" in pred_all.columns) and ("year" in pred_all.columns)
-    if not has_id_cols:
-        st.warning(
-            "Predictions loaded, but missing identifier columns (county/year). "
-            "Your prediction outputs look like raw SageMaker CSV (single-column). "
-            "For a full demo, ensure your transform output includes county + year columns "
-            "(or you keep the input manifest order and merge back)."
-        )
-
-    # Actuals (optional)
-    actuals_df = None
-    try:
-        actuals_df = load_actuals(region, actuals_uri)
-    except Exception as e:
-        st.info(f"Actuals not loaded (optional): {e}")
-
-    # Frozen features (optional)
-    features_by_season = {}
-    if use_features:
-        for s in seasons:
-            try:
-                fprefix = (
-                    f"s3://{bucket}/features_frozen/"
-                    f"state_fips={state_fips}/"
-                    f"county_fips={county_fips}/"
-                    f"feature_season={s}/"
-                    f"run_date={run_date}/"
-                )
-                features_by_season[s] = load_features_frozen(region, fprefix)
-            except Exception as e:
-                features_by_season[s] = None
-
-    return pred_all, actuals_df, features_by_season, debug_info
+    st.subheader("Optional: Trigger Step Functions")
+    sf_arn = st.text_input("State machine ARN", value=os.getenv("STATE_MACHINE_ARN", ""))
+    do_trigger = st.checkbox("Show trigger controls", value=False)
 
 
 if load_btn:
     st.cache_data.clear()
 
-# Load on first render as well (best-effort)
-if "data_loaded" not in st.session_state or load_btn:
-    with st.spinner("Loading data from S3..."):
-        try:
-            pred_all, actuals_df, features_by_season, debug_info = _load_all()
-            st.session_state["pred_all"] = pred_all
-            st.session_state["actuals_df"] = actuals_df
-            st.session_state["features_by_season"] = features_by_season
-            st.session_state["debug_info"] = debug_info
-            st.session_state["data_loaded"] = True
-        except Exception as e:
-            st.session_state["data_loaded"] = False
-            st.error(f"Failed to load data: {e}")
+# --------------- Load data ---------------
 
-if not st.session_state.get("data_loaded", False):
-    st.stop()
+@st.cache_data(show_spinner=False)
+def _load_all_years(
+    region: str,
+    bucket: str,
+    state_fips: str,
+    county_fips: str,
+    years: List[int],
+    feature_season: str,
+    run_date: str,
+    model_name: str,
+    actuals_uri: str,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], List[Dict]]:
+    pred_all = []
+    dbg_all = []
+    for y in years:
+        d, dbg = load_predictions_from_features_frozen(
+            region=region,
+            bucket=bucket,
+            state_fips=state_fips,
+            county_fips=county_fips,
+            predict_year=int(y),
+            feature_season=feature_season,
+            run_date=run_date,
+            model_name=model_name,
+        )
+        pred_all.append(d)
+        dbg_all.append(dbg)
+    pred_all = pd.concat(pred_all, ignore_index=True)
 
-pred_all: pd.DataFrame = st.session_state["pred_all"]
-actuals_df: Optional[pd.DataFrame] = st.session_state["actuals_df"]
-features_by_season: Dict[str, Optional[pd.DataFrame]] = st.session_state["features_by_season"]
-debug_info: List[Dict] = st.session_state["debug_info"]
+    # actuals (optional but recommended)
+    actuals_df = None
+    try:
+        actuals_df = load_actuals(region, actuals_uri)
+    except Exception:
+        actuals_df = None
+
+    return pred_all, actuals_df, dbg_all
 
 
-# ----------------------------
-# Debug panel
-# ----------------------------
-with st.expander("Debug: S3 paths / files found"):
-    st.json(debug_info)
+with st.spinner("Loading data from S3..."):
+    try:
+        pred_all, actuals_df, dbg_all = _load_all_years(
+            region, bucket, state_fips, county_fips, years, feature_season, run_date, model_name, actuals_uri
+        )
+    except Exception as e:
+        st.error(f"Failed to load predictions: {e}")
+        st.stop()
 
-# ----------------------------
-# Quick integrity checks
-# ----------------------------
-st.subheader("Data sanity checks")
+# --------------- County selection ---------------
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.metric("Rows (predictions)", f"{len(pred_all):,}")
-with c2:
-    st.metric("Seasons", ", ".join(sorted(pred_all["feature_season"].unique().tolist())))
-with c3:
-    yr = pred_all["year"].dropna().unique().tolist() if "year" in pred_all.columns else []
-    st.metric("Years present", ", ".join(map(str, sorted(yr))) if yr else "N/A")
+county_options = []
+if "county_norm" in pred_all.columns:
+    county_options = sorted([c for c in pred_all["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
+elif actuals_df is not None and "county_norm" in actuals_df.columns:
+    county_options = sorted([c for c in actuals_df["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
 
-if "year" in pred_all.columns and "county_norm" in pred_all.columns:
-    chk = (
-        pred_all[pred_all["year"] == feature_year]
-        .groupby(["feature_season"])["county_norm"]
-        .nunique()
-        .sort_index()
-        .reset_index()
-        .rename(columns={"county_norm": "unique_counties_predicted"})
+if not county_options:
+    st.warning(
+        "Could not infer counties from predictions/actuals. "
+        "Your features_frozen outputs might be missing a 'county' or 'county_name' column. "
+        "If so, update your inference outputs to include county."
     )
-    st.dataframe(chk, use_container_width=True)
-
-    dups = pred_all[pred_all["year"] == feature_year].duplicated(
-        subset=["feature_season", "county_norm", "year"], keep=False
-    )
-    if dups.any():
-        st.warning(f"Found {int(dups.sum())} duplicate county-season-year rows in predictions. Consider deduping.")
+    county_selected = None
 else:
-    st.info("County/year columns not found in prediction outputs; some visualizations will be limited.")
+    county_selected = st.selectbox("Select county", options=county_options, index=0)
 
+# ---------------- Tabs ----------------
 
-# ----------------------------
-# Tabs
-# ----------------------------
-tab_overview, tab_cutoffs, tab_metrics, tab_drivers, tab_report = st.tabs(
-    ["Overview", "Cutoff comparison", "Metrics & Fit", "Driver signals", "Downloadable report"]
+tab_main, tab_debug, tab_export, tab_valueadd = st.tabs(
+    ["County trend (2020–2025)", "Debug (S3 files)", "Download report", "Value-add views"]
 )
 
-with tab_overview:
-    st.markdown("### What to show in your final demo (best-case scenario)")
-    st.markdown(
-        """
-**Recommended narrative (5–7 minutes):**
-1) **Problem**: Forecast Iowa county-level corn yield using remote sensing + weather + storm risk.  
-2) **Data**: NDVI (vegetation), ERA5-Land (weather), Storm events, USDA yield labels.  
-3) **Models**: Multiple **cutoff-date** models (Jun01 → Aug15) with expanding information set.  
-4) **Results**: Show cutoff comparison + top/bottom counties + (if available) actual-vs-predicted + error metrics.  
-5) **Interpretability**: Driver signals (NDVI peak/slope, heat days, moisture stress, storm wind days).  
-6) **Deployment**: S3 + containers + Step Functions + SageMaker batch transform (already done).  
-        """
-    )
+with tab_main:
+    if county_selected is None:
+        st.stop()
 
-    st.markdown("### Preview of predictions")
-    st.dataframe(pred_all.head(50), use_container_width=True)
+    series_df = build_observed_vs_pred_series(pred_all, actuals_df, county_selected, years)
+    st.dataframe(series_df, use_container_width=True)
 
-with tab_cutoffs:
-    _plotly_or_fallback_warning()
-
-    st.markdown("### Distribution of predicted yield (2025) by cutoff")
-    if _HAS_PLOTLY and "year" in pred_all.columns and "prediction" in pred_all.columns:
-        p2025 = pred_all[pred_all["year"] == feature_year].copy()
-        fig = px.histogram(
-            p2025,
-            x="prediction",
-            color="feature_season",
-            nbins=30,
-            barmode="overlay",
-            opacity=0.45,
-            title=f"Predicted yield distribution ({feature_year}) by cutoff",
-        )
+    title = f"Observed vs Mean Prediction — {county_selected.title()} — {start_year}-{end_year}"
+    if _HAS_PLOTLY:
+        fig = plot_observed_vs_pred_plotly(series_df, title=title)
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Need Plotly + year/prediction columns for this chart.")
+        st.info("Install plotly for interactive charts: pip install plotly")
 
-    st.markdown("### County rankings (top/bottom) by cutoff")
-    if "year" in pred_all.columns and "county_norm" in pred_all.columns and "prediction" in pred_all.columns:
-        n = st.slider("Top/bottom N", min_value=5, max_value=25, value=10, step=1)
-        tbl = pd.concat([top_bottom(pred_all, s, feature_year, n=n) for s in seasons], ignore_index=True)
-        st.dataframe(tbl.sort_values(["feature_season", "rank", "prediction"], ascending=[True, True, False]), use_container_width=True)
+    # optional trigger
+    if do_trigger and sf_arn.strip():
+        st.markdown("### Trigger inference pipeline (Step Functions)")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            exec_name = st.text_input(
+                "Execution name (optional)",
+                value=f"{county_selected.replace(' ','_')}-{feature_season}-{run_date}-{start_year}-{end_year}"
+            )
+        with c2:
+            st.caption("Execution input will include state_fips, predict_year(s), season, model, run_date, county_fips=ALL.")
+
+        if st.button("Start execution", type="secondary"):
+            try:
+                sf = _sf_client(region)
+                payload = {
+                    "run_date": str(run_date),
+                    "state_fips": str(state_fips),
+                    "county_fips": "ALL",
+                    "feature_season": str(feature_season),
+                    "model_name": str(model_name),
+                    "predict_years": [int(y) for y in years],
+                }
+                args = {"stateMachineArn": sf_arn, "input": json_dumps(payload)}
+                if exec_name.strip():
+                    args["name"] = exec_name.strip()[:80]  # Step Functions name limit
+                resp = sf.start_execution(**args)
+                st.success("Started execution.")
+                st.write("executionArn:", resp.get("executionArn"))
+            except Exception as e:
+                st.error(f"Failed to start execution: {e}")
+    elif do_trigger and not sf_arn.strip():
+        st.info("Provide a State machine ARN in the sidebar to enable triggering.")
+
+with tab_debug:
+    st.markdown("### Debug info (what was searched under features_frozen)")
+    st.json(dbg_all)
+    st.markdown("### Predictions preview")
+    st.dataframe(pred_all.head(50), use_container_width=True)
+    if actuals_df is not None:
+        st.markdown("### Actuals preview")
+        st.dataframe(actuals_df.head(50), use_container_width=True)
+
+with tab_export:
+    st.markdown("### Download report (PDF)")
+    if county_selected is None:
+        st.stop()
+
+    series_df = build_observed_vs_pred_series(pred_all, actuals_df, county_selected, years)
+    metrics = compute_series_metrics(series_df)
+
+    params = {
+        "bucket": bucket,
+        "state_fips": state_fips,
+        "county_fips": county_fips,
+        "county": county_selected,
+        "season": feature_season,
+        "model": model_name,
+        "run_date": run_date,
+        "years": f"{start_year}-{end_year}",
+    }
+
+    if not _HAS_PDF:
+        st.warning("PDF export needs reportlab. Install: pip install reportlab")
+    elif not _HAS_MPL:
+        st.warning("PDF export needs matplotlib. Install: pip install matplotlib")
     else:
-        st.info("Need county_norm + year + prediction columns for rankings.")
-
-    st.markdown("### Cutoff agreement (how stable are predictions across cutoffs?)")
-    if "year" in pred_all.columns and "county_norm" in pred_all.columns and "prediction" in pred_all.columns:
-        p = pred_all[pred_all["year"] == feature_year].copy()
-        piv = p.pivot_table(index="county_norm", columns="feature_season", values="prediction", aggfunc="mean")
-        st.dataframe(piv.head(25), use_container_width=True)
-        if _HAS_PLOTLY:
-            corr = piv.corr()
-            fig2 = px.imshow(corr, text_auto=True, title=f"Correlation between cutoffs (predictions) — {feature_year}")
-            st.plotly_chart(fig2, use_container_width=True)
-
-with tab_metrics:
-    st.markdown("### Actual vs Predicted + error metrics (if actuals are available)")
-    if actuals_df is None:
-        st.info("Actuals not loaded (optional). Point actuals_uri to a valid curated actuals parquet.")
-    elif not {"county_norm","year","yield_bu_acre"}.issubset(actuals_df.columns):
-        st.warning("Actuals loaded but missing required columns (county_norm, year, yield_bu_acre).")
-    elif not {"county_norm","year","prediction","feature_season"}.issubset(pred_all.columns):
-        st.warning("Predictions missing required columns to merge with actuals.")
-    else:
-        merged = pred_all.merge(
-            actuals_df[["county_norm", "year", "yield_bu_acre"]],
-            on=["county_norm", "year"],
-            how="inner"
+        pdf_title = f"GeoAI Yield Report — {county_selected.title()} — {start_year}-{end_year}"
+        pdf_bytes = build_pdf_report_bytes(series_df, title=pdf_title, params=params, metrics=metrics)
+        st.download_button(
+            "Download PDF",
+            data=pdf_bytes,
+            file_name=f"geoai_yield_report_{county_selected.replace(' ','_')}_{start_year}_{end_year}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
         )
-        merged = merged.dropna(subset=["yield_bu_acre", "prediction"])
-        if merged.empty:
-            st.warning("No overlap between predictions and actuals (check year/state/county).")
-        else:
-            met = compute_metrics(merged)
-            st.dataframe(met, use_container_width=True)
 
+with tab_valueadd:
+    st.markdown("### Value-add views (great for final presentation)")
+    st.caption("These views help you explain model stability, risk, and outliers quickly.")
+
+    if county_selected is None:
+        st.stop()
+
+    # 1) Year-over-year delta (predicted)
+    st.markdown("#### 1) Year-over-year change (Mean Prediction)")
+    series_df = build_observed_vs_pred_series(pred_all, actuals_df, county_selected, years).copy()
+    series_df["pred_yoy_delta"] = series_df["mean_prediction"].diff()
+    st.dataframe(series_df[["year", "mean_prediction", "pred_yoy_delta"]], use_container_width=True)
+
+    # 2) County percentile rank in each year (if we have county ids)
+    st.markdown("#### 2) County percentile rank (Predicted) within Iowa by year")
+    if "county_norm" in pred_all.columns:
+        ranks = []
+        for y in years:
+            g = pred_all[pred_all["year"] == y].copy()
+            if g.empty:
+                continue
+            by = g.groupby("county_norm")["prediction"].mean().reset_index()
+            by["percentile"] = by["prediction"].rank(pct=True)
+            row = by[by["county_norm"] == county_selected]
+            if not row.empty:
+                ranks.append({"year": int(y), "predicted_percentile": float(row["percentile"].iloc[0])})
+        if ranks:
+            rk = pd.DataFrame(ranks).sort_values("year")
+            st.dataframe(rk, use_container_width=True)
             if _HAS_PLOTLY:
-                season_sel = st.selectbox("Pick cutoff to visualize", options=sorted(merged["feature_season"].unique().tolist()))
-                g = merged[merged["feature_season"] == season_sel].copy()
-
-                fig = px.scatter(
-                    g,
-                    x="yield_bu_acre",
-                    y="prediction",
-                    hover_name="county_norm",
-                    trendline="ols",
-                    title=f"Actual vs Predicted — {season_sel} — {feature_year}",
-                    labels={"yield_bu_acre": "Actual yield (bu/acre)", "prediction": "Predicted yield (bu/acre)"},
-                )
+                fig = px.line(rk, x="year", y="predicted_percentile", markers=True, title="Predicted percentile over time")
                 st.plotly_chart(fig, use_container_width=True)
-
-                g["residual"] = g["prediction"] - g["yield_bu_acre"]
-                fig2 = px.histogram(g, x="residual", nbins=35, title=f"Residual distribution — {season_sel}")
-                st.plotly_chart(fig2, use_container_width=True)
-
-with tab_drivers:
-    st.markdown("### Driver signals (optional): NDVI / Weather / Storm features used for inference")
-    st.caption("Loads from features_frozen/... and correlates drivers with predictions for quick interpretability.")
-
-    if not use_features:
-        st.info("Enable 'Load frozen features (drivers)' in the sidebar to use this tab.")
-    else:
-        season_sel = st.selectbox("Cutoff season", options=seasons, index=0)
-        fdf = features_by_season.get(season_sel)
-
-        if fdf is None:
-            st.warning(f"No frozen features found/loaded for season={season_sel}. Check S3 path or disable this tab.")
         else:
-            st.write(f"Frozen features rows: {len(fdf):,}")
-            st.dataframe(fdf.head(25), use_container_width=True)
+            st.info("Not enough data to compute percentile ranks.")
+    else:
+        st.info("County ids are missing in predictions, so percentile ranks can't be computed.")
 
-            if "year" in pred_all.columns and "county_norm" in pred_all.columns:
-                p = pred_all[(pred_all["feature_season"] == season_sel) & (pred_all["year"] == feature_year)].copy()
-                join_cols = ["county_norm", "year"]
-                drivers = fdf.copy()
-
-                # pick a small set of common driver columns if present
-                candidate_drivers = [
-                    "ndvi_peak", "ndvi_slope", "ndvi_auc", "ndvi_at_cutoff",
-                    "heat_days_gt32", "rain_sum_mm", "temp_anomaly", "net_moisture_stress",
-                    "wind_severe_days_58_cutoff", "hail_days", "tornado_days"
-                ]
-                driver_cols = [c for c in candidate_drivers if c in drivers.columns]
-
-                if not driver_cols:
-                    st.info("No known driver columns found. Select any numeric columns below.")
-                    numeric_cols = drivers.select_dtypes(include=[np.number]).columns.tolist()
-                    driver_cols = st.multiselect("Pick numeric driver columns", options=numeric_cols, default=numeric_cols[:6])
-
-                dsmall = drivers[join_cols + driver_cols].copy()
-                #j = p.merge(dsmall, on=join_cols, how="inner").dropna(subset=["prediction"])
-                p = dedupe_columns(p)
-                dsmall = dedupe_columns(dsmall)
-
-                missing_left = [c for c in join_cols if c not in p.columns]
-                missing_right = [c for c in join_cols if c not in dsmall.columns]
-
-                if missing_left or missing_right:
-                    st.warning(f"Driver join skipped. Missing keys. pred missing={missing_left}, features missing={missing_right}")
-                    st.stop()
-
-                try:
-                    j = p.merge(dsmall, on=join_cols, how="inner").dropna(subset=["prediction"])
-                    if j.empty:
-                        st.warning("No overlap between predictions and frozen features (check keys).")
-                    else:
-                        st.markdown("#### Driver correlation with prediction")
-                        corr_rows = []
-                        for c in driver_cols:
-                            if c in j.columns and pd.api.types.is_numeric_dtype(j[c]):
-                                corr_rows.append({"driver": c, "corr_with_pred": float(j[c].corr(j["prediction"]))})
-                        corr_df = pd.DataFrame(corr_rows).sort_values("corr_with_pred", ascending=False)
-                        st.dataframe(corr_df, use_container_width=True)
-
-                        if _HAS_PLOTLY and len(driver_cols) > 0:
-                            driver_pick = st.selectbox("Scatter plot driver vs prediction", options=driver_cols, index=0)
-                            fig = px.scatter(
-                                j, x=driver_pick, y="prediction",
-                                hover_name="county_norm",
-                                title=f"{driver_pick} vs prediction ({season_sel}, {feature_year})"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                except ValueError as e:
-                    st.warning(f"Driver join failed (likely duplicate join columns). Error: {e}")
-                    st.write("Pred duplicate columns:", list(p.columns[p.columns.duplicated()]))
-                    st.write("Feat duplicate columns:", list(dsmall.columns[dsmall.columns.duplicated()]))
-                    st.stop()                
-
-with tab_report:
-    st.markdown("### Downloadable HTML report")
-    st.caption("Generates a single self-contained HTML file with key charts + tables for your professor demo.")
-
-    def build_report_html() -> str:
-        # core summary
-        html_parts = []
-        html_parts.append("<html><head><meta charset='utf-8'><title>GeoAI Capstone Report</title></head><body>")
-        html_parts.append(f"<h1>GeoAI Crop Yield Prediction — Report</h1>")
-        html_parts.append(f"<p><b>Bucket:</b> {bucket} &nbsp; <b>State FIPS:</b> {state_fips} &nbsp; <b>County FIPS:</b> {county_fips} &nbsp; <b>Run date:</b> {run_date}</p>")
-        html_parts.append(f"<p><b>Seasons:</b> {', '.join(seasons)}</p>")
-
-        # metrics
-        if actuals_df is not None and {"county_norm","year","yield_bu_acre"}.issubset(actuals_df.columns) and {"county_norm","year","prediction","feature_season"}.issubset(pred_all.columns):
-            merged = pred_all.merge(actuals_df[["county_norm","year","yield_bu_acre"]], on=["county_norm","year"], how="inner")
-            merged = merged.dropna(subset=["yield_bu_acre", "prediction"])
-            if not merged.empty:
-                met = compute_metrics(merged)
-                html_parts.append("<h2>Metrics (Actual vs Predicted)</h2>")
-                html_parts.append(met.to_html(index=False))
-
-        # top/bottom
-        if {"county_norm","year","prediction","feature_season"}.issubset(pred_all.columns):
-            tbl = pd.concat([top_bottom(pred_all, s, feature_year, n=10) for s in seasons], ignore_index=True)
-            html_parts.append("<h2>Top/Bottom Counties (2025)</h2>")
-            html_parts.append(tbl.to_html(index=False))
-
-        # include key charts if plotly exists
-        if _HAS_PLOTLY and "year" in pred_all.columns and "prediction" in pred_all.columns:
-            p2025 = pred_all[pred_all["year"] == feature_year].copy()
-            fig = px.histogram(p2025, x="prediction", color="feature_season", nbins=30, barmode="overlay", opacity=0.45,
-                               title=f"Predicted yield distribution ({feature_year}) by cutoff")
-            html_parts.append("<h2>Predicted Yield Distribution</h2>")
-            html_parts.append(fig.to_html(full_html=False, include_plotlyjs="cdn"))
-
-        html_parts.append("</body></html>")
-        return "\n".join(html_parts)
-
-    html = build_report_html().encode("utf-8")
-    st.download_button(
-        label="Download HTML report",
-        data=html,
-        file_name=f"geoai_capstone_report_{state_fips}_{county_fips}_{run_date}.html",
-        mime="text/html",
-        use_container_width=True
-    )
-
+    # 3) Error over time (if actuals exist)
+    st.markdown("#### 3) Error over time (Observed - Mean Prediction)")
+    if series_df["observed_yield"].notna().any():
+        series_df["error"] = series_df["observed_yield"] - series_df["mean_prediction"]
+        st.dataframe(series_df[["year", "observed_yield", "mean_prediction", "error"]], use_container_width=True)
+        if _HAS_PLOTLY:
+            fig = px.bar(series_df.dropna(subset=["error"]), x="year", y="error", title="Error over time (Observed - Predicted)")
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Actuals not available for these years; error view is disabled.")
