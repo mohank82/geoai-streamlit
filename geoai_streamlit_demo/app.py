@@ -695,8 +695,8 @@ def compute_series_metrics(series_df: pd.DataFrame) -> Optional[Dict[str, float]
 
 st.set_page_config(page_title="GeoAI Yield Risk Demo", layout="wide")
 
-st.title("GeoAI Yield Risk Detection — Demo Dashboard")
-st.caption("County-wise observed vs predicted yields (2020–2025) + Step Functions trigger + PDF export.")
+st.title("GeoAI Early Yield Predection")
+st.caption("County-wise observed vs predicted yields for Iowa (2020–2025)")
 
 with st.sidebar:
     st.header("Settings")
