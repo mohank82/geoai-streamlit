@@ -397,6 +397,9 @@ def build_observed_vs_pred_series(
 
     p = pred_df[pred_df["year"].isin(years)].copy()
 
+    # Drop accidental statewide rows before computing statewide mean
+    p = p[~p["county_norm"].isin(["iowa", "statewide", "all"])]
+
     if is_statewide:
         pred_series = (
             p.groupby("year")["prediction"]
