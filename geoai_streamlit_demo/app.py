@@ -54,6 +54,7 @@ try:
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.units import inch
     from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
     _HAS_PDF = True
 except Exception:
     _HAS_PDF = False
@@ -540,7 +541,14 @@ def build_pdf_report_bytes(
     img_h = 3.2 * inch
     img_x = 0.75 * inch
     img_y = y - img_h
-    c.drawInlineImage(io.BytesIO(png), img_x, img_y, width=img_w, height=img_h)
+    # Use ImageReader to safely embed PNG bytes (avoids PIL format AttributeError)
+    try:
+        c.drawImage(ImageReader(io.BytesIO(png)), img_x, img_y, width=img_w, height=img_h, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        # If image embedding fails, skip the chart instead of crashing the app
+        c.setFont("Helvetica-Oblique", 10)
+        c.drawString(0.75 * inch, y, "[Chart unavailable in PDF export]")
+
     y = img_y - 0.35 * inch
 
     # data table
