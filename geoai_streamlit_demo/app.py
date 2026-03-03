@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
+from html import escape as html_escape
 import streamlit as st
 
 # Optional (recommended)
@@ -377,42 +378,79 @@ def build_observed_vs_pred_series(
     """
     Returns a tidy DataFrame:
       year, observed_yield, mean_prediction
-    """
-    p = pred_df[pred_df["county_norm"] == county_norm].copy() if "county_norm" in pred_df.columns else pred_df.copy()
-    p = p[p["year"].isin(years)]
-    pred_series = (
-        p.groupby("year")["prediction"]
-         .mean()
-         .reset_index()
-         .rename(columns={"prediction": "mean_prediction"})
-    )
 
-    if actuals_df is not None and {"county_norm", "year"}.issubset(actuals_df.columns):
-        # prefer observed_yield if present; fall back to yield_bu_acre
+    Special handling:
+    - If county_norm is one of {"__statewide__", "iowa", "statewide", "all"}, compute STATEWIDE series
+      by aggregating across all counties for each year.
+    """
+    # Identify special statewide selection
+    is_statewide = str(county_norm).strip().lower() in {"__statewide__", "iowa", "statewide", "all"}
+
+    # Base x-axis (ensures all requested years appear)
+    base = pd.DataFrame({"year": [int(y) for y in years]})
+
+    # Predictions (county or statewide)
+    if "county_norm" not in pred_df.columns and "county" in pred_df.columns:
+        pred_df = pred_df.copy()
+        pred_df["county_norm"] = pred_df["county"].map(normalize_county_name)
+
+    p = pred_df[pred_df["year"].isin(years)].copy()
+
+    if is_statewide:
+        pred_series = (
+            p.groupby("year")["prediction"]
+             .mean()
+             .reset_index()
+             .rename(columns={"prediction": "mean_prediction"})
+        )
+    else:
+        pred_series = (
+            p[p["county_norm"] == county_norm]
+            .groupby("year")["prediction"]
+            .mean()
+            .reset_index()
+            .rename(columns={"prediction": "mean_prediction"})
+        )
+
+    out = base.merge(pred_series, on="year", how="left")
+
+    # Actuals (county or statewide)
+    if actuals_df is not None and "year" in actuals_df.columns:
         obs_col = "observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre"
         if obs_col in actuals_df.columns:
-            a = actuals_df[
-                (actuals_df["county_norm"] == county_norm) &
-                (actuals_df["year"].isin(years))
-            ][["year", obs_col]].copy()
+            a = actuals_df[actuals_df["year"].isin(years)].copy()
 
-            a = a.rename(columns={obs_col: "observed_yield"})
-            # make sure numeric
-            a["observed_yield"] = pd.to_numeric(a["observed_yield"], errors="coerce")
+            if "county_norm" not in a.columns and "county" in a.columns:
+                a["county_norm"] = a["county"].map(normalize_county_name)
 
-            out = pd.merge(pred_series, a, on="year", how="left")
+            if is_statewide:
+                a_series = (
+                    a.groupby("year")[obs_col]
+                     .mean()
+                     .reset_index()
+                     .rename(columns={obs_col: "observed_yield"})
+                )
+            else:
+                a_series = (
+                    a[a["county_norm"] == county_norm]
+                    .groupby("year")[obs_col]
+                    .mean()
+                    .reset_index()
+                    .rename(columns={obs_col: "observed_yield"})
+                )
+
+            out = out.merge(a_series, on="year", how="left")
         else:
-            out = pred_series.copy()
             out["observed_yield"] = np.nan
     else:
-        out = pred_series.copy()
         out["observed_yield"] = np.nan
+
     # final tidy
     out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
     out["mean_prediction"] = pd.to_numeric(out["mean_prediction"], errors="coerce")
     out["observed_yield"] = pd.to_numeric(out["observed_yield"], errors="coerce")
-
     return out
+
 
 
 def plot_observed_vs_pred_plotly(df: pd.DataFrame, title: str):
@@ -531,6 +569,104 @@ def build_pdf_report_bytes(
     return buf.getvalue()
 
 
+
+
+
+def build_html_report_str(
+    series_df: pd.DataFrame,
+    title: str,
+    params: Dict[str, str],
+    metrics: Optional[Dict[str, float]] = None,
+    fig: Optional[object] = None,
+) -> str:
+    """Build a single self-contained HTML report string."""
+    # Basic CSS for readability
+    css = """
+    <style>
+      body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 24px; }
+      h1 { margin: 0 0 8px 0; }
+      .meta { color: #555; margin-bottom: 18px; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0 18px 0; }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+      .card h3 { margin: 0 0 6px 0; font-size: 14px; color:#333; }
+      table { border-collapse: collapse; width: 100%; font-size: 13px; }
+      th, td { border: 1px solid #e5e5e5; padding: 6px 8px; text-align: right; }
+      th:first-child, td:first-child { text-align: left; }
+      th { background: #fafafa; }
+      .note { color: #666; font-size: 12px; margin-top: 10px; }
+    </style>
+    """
+
+    # Params table
+    meta_rows = "".join([f"<tr><th>{html_escape(k)}</th><td style='text-align:left'>{html_escape(str(v))}</td></tr>" for k, v in params.items()])
+    meta_table = f"<table><tbody>{meta_rows}</tbody></table>"
+
+    # Metrics table
+    metrics_html = ""
+    if metrics:
+        m_rows = "".join([f"<tr><th>{html_escape(k)}</th><td>{'' if v is None else f'{v:.4f}'}</td></tr>" for k, v in metrics.items()])
+        metrics_html = f"<table><tbody>{m_rows}</tbody></table>"
+    else:
+        metrics_html = "<div class='note'>Metrics not available (need observed yields for the selected range).</div>"
+
+    # Figure HTML (Plotly if available)
+    fig_html = ""
+    if fig is not None and hasattr(fig, "to_html"):
+        try:
+            fig_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
+        except Exception:
+            fig_html = ""
+    if not fig_html:
+        fig_html = "<div class='note'>Chart unavailable (Plotly not installed or figure rendering failed).</div>"
+
+    # Series table
+    table_df = series_df.copy()
+    # consistent column ordering if present
+    cols = [c for c in ["year", "mean_prediction", "prediction", "observed_yield"] if c in table_df.columns]
+    if cols:
+        table_df = table_df[cols]
+    series_table = table_df.to_html(index=False, border=0, classes="dataframe")
+
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset='utf-8' />
+      <title>{html_escape(title)}</title>
+      {css}
+    </head>
+    <body>
+      <h1>{html_escape(title)}</h1>
+      <div class='meta'>Generated: {html_escape(pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M UTC'))}</div>
+
+      <div class='grid'>
+        <div class='card'>
+          <h3>Run parameters</h3>
+          {meta_table}
+        </div>
+        <div class='card'>
+          <h3>Quick metrics</h3>
+          {metrics_html}
+        </div>
+      </div>
+
+      <div class='card'>
+        <h3>Observed vs Mean Prediction</h3>
+        {fig_html}
+      </div>
+
+      <div class='card' style='margin-top:12px'>
+        <h3>Yearly values</h3>
+        {series_table}
+        <div class='note'>Note: Observed yield may be missing for the latest year (e.g., 2025) until USDA publishes it.</div>
+      </div>
+    </body>
+    </html>
+    """
+    return html
+
+
+
 def compute_series_metrics(series_df: pd.DataFrame) -> Optional[Dict[str, float]]:
     d = series_df.dropna(subset=["observed_yield", "mean_prediction"]).copy()
     if len(d) < 2:
@@ -646,23 +782,36 @@ with st.spinner("Loading data from S3..."):
 
 # --------------- County selection ---------------
 
-county_options = []
+# We treat "Statewide (Iowa)" as a special option and compute statewide series by aggregating across counties.
+STATEWIDE_KEY = "__statewide__"
+STATEWIDE_LABEL = "Statewide (Iowa)"
+
+county_options: List[str] = []
 if "county_norm" in pred_all.columns:
     county_options = sorted([c for c in pred_all["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
 elif actuals_df is not None and "county_norm" in actuals_df.columns:
     county_options = sorted([c for c in actuals_df["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
 
+# Remove any accidental statewide-like keys from the list (we add a single clean option)
+county_options = [c for c in county_options if str(c).strip().lower() not in {"iowa", "statewide", "all", STATEWIDE_KEY}]
+
 if not county_options:
     st.warning(
         "Could not infer counties from predictions/actuals. "
-        "Your prediction outputs might be missing a 'county' or 'county_name' column. "
+        "Your prediction outputs might be missing a 'county' column. "
         "If so, update your inference outputs to include county."
     )
     county_selected = None
 else:
-    county_selected = st.selectbox("Select county", options=county_options, index=0)
+    options = [STATEWIDE_KEY] + county_options
+
+    def _county_label(x: str) -> str:
+        return STATEWIDE_LABEL if x == STATEWIDE_KEY else str(x).title()
+
+    county_selected = st.selectbox("Select county", options=options, index=0, format_func=_county_label)
 
 # ---------------- Tabs ----------------
+
 
 tab_main, tab_debug, tab_export, tab_valueadd = st.tabs(
     ["County trend (2020–2025)", "Debug (S3 files)", "Download report", "Value-add views"]
@@ -687,18 +836,27 @@ with tab_main:
         )
 
         # Extra debug: show what actuals has for this county across the selected years
-        if actuals_df is not None and "county_norm" in actuals_df.columns and "year" in actuals_df.columns:
-            obs_col = "observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre"
-            a_dbg = actuals_df[
-                (actuals_df["county_norm"] == county_selected) &
-                (actuals_df["year"].isin(years))
-            ][["county", "county_norm", "year", obs_col]].copy()
+if actuals_df is not None and "year" in actuals_df.columns:
+    obs_col = "observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre"
 
-            a_dbg = a_dbg.rename(columns={obs_col: "observed_yield"})
-            st.caption("Actuals rows found for this county in curated actuals.parquet (debug):")
-            st.dataframe(a_dbg.sort_values("year"), use_container_width=True)
+    if county_selected == STATEWIDE_KEY:
+        a_dbg = (actuals_df[actuals_df["year"].isin(years)]
+                 .groupby("year", as_index=False)[obs_col]
+                 .mean()
+                 .rename(columns={obs_col: "observed_yield"}))
+        st.caption("Actuals (STATEWIDE mean across counties) from curated actuals.parquet (debug):")
+        st.dataframe(a_dbg.sort_values("year"), use_container_width=True)
+    else:
+        a_dbg = actuals_df[
+            (actuals_df["county_norm"] == county_selected) &
+            (actuals_df["year"].isin(years))
+        ][["county", "county_norm", "year", obs_col]].copy()
 
-    title = f"Observed vs Mean Prediction — {county_selected.title()} — {start_year}-{end_year}"
+        a_dbg = a_dbg.rename(columns={obs_col: "observed_yield"})
+        st.caption("Actuals rows found for this county in curated actuals.parquet (debug):")
+        st.dataframe(a_dbg.sort_values("year"), use_container_width=True)
+
+    title = f"Observed vs Mean Prediction — {(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {start_year}-{end_year}"
     if _HAS_PLOTLY:
         fig = plot_observed_vs_pred_plotly(series_df, title=title)
         st.plotly_chart(fig, use_container_width=True)
@@ -749,7 +907,8 @@ with tab_debug:
         st.dataframe(actuals_df.head(50), use_container_width=True)
 
 with tab_export:
-    st.markdown("### Download report (PDF)")
+    st.markdown("### Download report")
+
     if county_selected is None:
         st.stop()
 
@@ -760,29 +919,60 @@ with tab_export:
         "bucket": bucket,
         "state_fips": state_fips,
         "county_fips": county_fips,
-        "county": county_selected,
+        "county": (STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected),
         "season": feature_season,
         "model": model_name,
         "run_date": run_date,
         "years": f"{start_year}-{end_year}",
     }
 
+    # Build the chart figure for embedding in HTML/PDF when possible
+    fig = None
+    if _HAS_PLOTLY:
+        try:
+            fig = make_observed_vs_pred_plotly(series_df, county_selected, state_fips)
+        except Exception:
+            fig = None
+
+    report_title = f"GeoAI Yield Report — {(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {start_year}-{end_year}"
+
+    # ---- HTML export (always available) ----
+    html_str = build_html_report_str(series_df, title=report_title, params=params, metrics=metrics, fig=fig)
+    st.download_button(
+        "Download HTML report",
+        data=html_str.encode("utf-8"),
+        file_name=f"geoai_yield_report_{(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected).replace(' ','_')}_{start_year}_{end_year}.html",
+        mime="text/html",
+        use_container_width=True,
+    )
+
+    st.divider()
+
+    # ---- PDF export (optional) ----
+    st.markdown("#### PDF export")
+
     if not _HAS_PDF:
-        st.warning("PDF export needs reportlab. Install: pip install reportlab")
+        st.warning(
+            "PDF export needs **reportlab**. Install it in the same environment where Streamlit runs: "
+            "`pip install reportlab`"
+        )
     elif not _HAS_MPL:
-        st.warning("PDF export needs matplotlib. Install: pip install matplotlib")
+        st.warning(
+            "PDF export needs **matplotlib**. Install it in the same environment where Streamlit runs: "
+            "`pip install matplotlib`"
+        )
     else:
-        pdf_title = f"GeoAI Yield Report — {county_selected.title()} — {start_year}-{end_year}"
-        pdf_bytes = build_pdf_report_bytes(series_df, title=pdf_title, params=params, metrics=metrics)
+        pdf_bytes = build_pdf_report_bytes(series_df, title=report_title, params=params, metrics=metrics)
         st.download_button(
-            "Download PDF",
+            "Download PDF report",
             data=pdf_bytes,
-            file_name=f"geoai_yield_report_{county_selected.replace(' ','_')}_{start_year}_{end_year}.pdf",
+            file_name=f"geoai_yield_report_{(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected).replace(' ','_')}_{start_year}_{end_year}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
 
 with tab_valueadd:
+
     st.markdown("### Value-add views (great for final presentation)")
     st.caption("These views help you explain model stability, risk, and outliers quickly.")
 
