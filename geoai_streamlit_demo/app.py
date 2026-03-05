@@ -157,7 +157,7 @@ def _sf_client(region_name: str):
     _require_aws()
     return boto3.client("stepfunctions", region_name=region_name)
 
-def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".csv")) -> List[str]:
+def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".parquet.out", ".csv")) -> List[str]:
     """
     Returns full s3:// URIs for objects under the given s3:// prefix.
     """
@@ -199,7 +199,7 @@ def s3_read_csv(uri: str, header: Optional[int] = "infer") -> pd.DataFrame:
 
 def _read_any_file(path_or_s3uri: str) -> pd.DataFrame:
     p = path_or_s3uri.lower()
-    if p.endswith(".parquet"):
+    if p.endswith(".parquet") or path.lower().endswith(".parquet.out"):
         return s3_read_parquet(path_or_s3uri)
     if p.endswith(".csv"):
         try:
@@ -278,12 +278,13 @@ def load_predictions_from_predictions_s3(
         "model_name": model_name,
     }
 
-    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".csv"))
+    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".parquet.out", ".csv"))
     dbg["files_found"] = len(files)
     dbg["files_preview"] = files[:10]
 
     if not files:
-        raise FileNotFoundError(f"No parquet/csv found under: {base_prefix}")
+        dbg["exists"] = False
+        return pd.DataFrame(), dbg
 
     dfs = []
     for f in files:
