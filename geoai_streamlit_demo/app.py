@@ -354,12 +354,17 @@ def list_available_run_dates_for_year(
 ) -> List[str]:
     """List run_date folders available in predictions S3 layout."""
     fs = s3fs.S3FileSystem(anon=False, client_kwargs={"region_name": region} if region else None)
-    pattern = (
+    pattern1 = (
         f"s3://{bucket}/predictions/"
         f"state_fips={state_fips}/county_fips={county_fips}/predict_year={predict_year}/"
         f"feature_season={feature_season}/run_date={run_date_glob}/model={model_name}/predictions.parquet"
     )
-    matches = fs.glob(pattern.replace("s3://", ""))
+    pattern2 = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/county_fips={county_fips}/predict_year={predict_year}/"
+        f"feature_season={feature_season}/run_date={run_date_glob}/model={model_name}/part.parquet.out"
+    )
+    matches = fs.glob(pattern1.replace("s3://", "")) + fs.glob(pattern2.replace("s3://", ""))
     run_dates = []
     for m in matches:
         parts = m.split("run_date=")
