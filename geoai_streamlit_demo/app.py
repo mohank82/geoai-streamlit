@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from html import escape as html_escape
 import streamlit as st
 
@@ -190,7 +191,11 @@ def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".par
 @st.cache_data(show_spinner=False)
 def s3_read_parquet(uri: str) -> pd.DataFrame:
     _require_aws()
-    return pd.read_parquet(uri, engine="pyarrow")
+    # Read parquet regardless of suffix (e.g., SageMaker Batch Transform 'part.parquet.out')
+    fs = s3fs.S3FileSystem()
+    with fs.open(uri, "rb") as f:
+        table = pq.read_table(f)
+    return table.to_pandas()
 
 @st.cache_data(show_spinner=False)
 def s3_read_csv(uri: str, header: Optional[int] = "infer") -> pd.DataFrame:
@@ -199,18 +204,21 @@ def s3_read_csv(uri: str, header: Optional[int] = "infer") -> pd.DataFrame:
 
 def _read_any_file(path_or_s3uri: str) -> pd.DataFrame:
     p = path_or_s3uri.lower()
-    if p.endswith(".parquet") or path.lower().endswith(".parquet.out"):
+
+    # Parquet (including Batch Transform .out suffix)
+    if p.endswith(".parquet") or p.endswith(".parquet.out") or p.endswith(".out"):
         return s3_read_parquet(path_or_s3uri)
+
+    # CSV
     if p.endswith(".csv"):
         try:
             df = s3_read_csv(path_or_s3uri, header="infer")
         except Exception:
             df = s3_read_csv(path_or_s3uri, header=None)
-        # handle 1-col output
-        if df.shape[1] == 1:
-            df.columns = ["prediction"]
         return df
+
     raise ValueError(f"Unsupported file type: {path_or_s3uri}")
+
 
 
 # ----------------------------
