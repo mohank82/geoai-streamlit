@@ -514,6 +514,23 @@ def build_observed_vs_pred_series(
         pred_df = pred_df.copy()
         pred_df["county_norm"] = pred_df["county"].map(normalize_county_name)
 
+    # Guard: if predictions do not include year, we cannot slice; return base with NaNs
+    if pred_df is None or len(pred_df)==0 or "year" not in pred_df.columns:
+        out = base.copy()
+        out["mean_prediction"] = np.nan
+        if actuals_df is not None and "year" in actuals_df.columns:
+            obs_col = "observed_yield" if "observed_yield" in actuals_df.columns else ("yield_bu_acre" if "yield_bu_acre" in actuals_df.columns else None)
+            if obs_col:
+                a = actuals_df[actuals_df["year"].isin(years)].copy()
+                if "county_norm" not in a.columns and "county" in a.columns:
+                    a["county_norm"] = a["county"].map(normalize_county_name)
+                if is_statewide:
+                    a_series = a.groupby("year")[obs_col].mean().reset_index().rename(columns={obs_col:"observed_yield"})
+                else:
+                    a_series = a[a["county_norm"]==county_norm].groupby("year")[obs_col].mean().reset_index().rename(columns={obs_col:"observed_yield"})
+                out = out.merge(a_series, on="year", how="left")
+        return out
+
     p = pred_df[pred_df["year"].isin(years)].copy()
 
     # Drop accidental statewide rows before computing statewide mean
@@ -1037,7 +1054,7 @@ if actuals_df is not None and "year" in actuals_df.columns:
         st.info("Provide a State machine ARN in the sidebar to enable triggering.")
 
 
-st.markdown("#### C) 2025 run-date comparison")
+st.markdown("#### C) 2025 run-date comparison (demo wow view)")
 st.caption("Compare how the *2025* prediction changes across different run dates. Great to explain model stability and the impact of new live storm data.")
 
 compare_year = int(target_year)  # default 2025
