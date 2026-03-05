@@ -1037,7 +1037,7 @@ if actuals_df is not None and "year" in actuals_df.columns:
         st.info("Provide a State machine ARN in the sidebar to enable triggering.")
 
 
-st.markdown("#### C) 2025 run-date comparison (demo wow view)")
+st.markdown("#### C) 2025 run-date comparison")
 st.caption("Compare how the *2025* prediction changes across different run dates. Great to explain model stability and the impact of new live storm data.")
 
 compare_year = int(target_year)  # default 2025
