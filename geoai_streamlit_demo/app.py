@@ -20,6 +20,16 @@ AWS Auth:
 """
 
 from __future__ import annotations
+def normalize_county(x: object) -> str:
+    """Normalize county names for joins / filters (lowercase, trim, drop 'county')."""
+    if x is None:
+        return ""
+    s = str(x).strip().lower()
+    s = re.sub(r"\s+county\s*$", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
 
 import io
 import os
@@ -30,6 +40,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
+import re
 import pyarrow.parquet as pq
 from html import escape as html_escape
 import streamlit as st
