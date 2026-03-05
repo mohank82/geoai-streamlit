@@ -22,6 +22,32 @@ AWS Auth:
 from __future__ import annotations
 def normalize_county(x: object) -> str:
     """Normalize county names for joins / filters (lowercase, trim, drop 'county')."""
+def plot_obs_pred_scatter(df: pd.DataFrame, title: str):
+    """Observed vs predicted scatter.
+
+    Plotly's trendline='ols' requires statsmodels+scipy which may not exist on Streamlit Cloud.
+    This helper uses OLS trendline when available; otherwise plots without a trendline.
+    """
+    try:
+        import statsmodels.api as _sm  # noqa: F401
+        return px.scatter(df, x="obs", y="pred", trendline="ols", title=title)
+    except Exception:
+        fig = px.scatter(df, x="obs", y="pred", title=title)
+        # Add a simple best-fit line via numpy (no dependencies) if enough points
+        try:
+            if len(df) >= 2:
+                x = df["obs"].astype(float).to_numpy()
+                y = df["pred"].astype(float).to_numpy()
+                import numpy as _np
+                m, b = _np.polyfit(x, y, 1)
+                xline = _np.array([x.min(), x.max()])
+                yline = m * xline + b
+                fig.add_trace(go.Scatter(x=xline, y=yline, mode="lines", name="fit"))
+        except Exception:
+            pass
+        return fig
+
+
     if x is None:
         return ""
     s = str(x).strip().lower()
@@ -1185,7 +1211,7 @@ with tab_valueadd:
         m2 = py.merge(ay, on="county_norm", how="inner")
         if not m2.empty:
             if _HAS_PLOTLY:
-                figs = px.scatter(m2, x="obs", y="pred", trendline="ols", title=f"Observed vs Predicted (county-level) — {year_for_scatter}")
+                figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) — {year_for_scatter}") — {year_for_scatter}")
                 st.plotly_chart(figs, use_container_width=True)
             st.write({"counties": int(len(m2)), "RMSE": metric_rmse(m2["obs"], m2["pred"]), "MAE": metric_mae(m2["obs"], m2["pred"]), "R2": metric_r2(m2["obs"], m2["pred"])})
         else:
