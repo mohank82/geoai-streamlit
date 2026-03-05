@@ -1211,7 +1211,7 @@ with tab_valueadd:
         m2 = py.merge(ay, on="county_norm", how="inner")
         if not m2.empty:
             if _HAS_PLOTLY:
-                figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) — {year_for_scatter}") — {year_for_scatter}")
+                figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) - {year_for_scatter}")
                 st.plotly_chart(figs, use_container_width=True)
             st.write({"counties": int(len(m2)), "RMSE": metric_rmse(m2["obs"], m2["pred"]), "MAE": metric_mae(m2["obs"], m2["pred"]), "R2": metric_r2(m2["obs"], m2["pred"])})
         else:
