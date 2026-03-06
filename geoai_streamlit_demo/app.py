@@ -20,42 +20,6 @@ AWS Auth:
 """
 
 from __future__ import annotations
-def normalize_county(x: object) -> str:
-    """Normalize county names for joins / filters (lowercase, trim, drop 'county')."""
-def plot_obs_pred_scatter(df: pd.DataFrame, title: str):
-    """Observed vs predicted scatter.
-
-    Plotly's trendline='ols' requires statsmodels+scipy which may not exist on Streamlit Cloud.
-    This helper uses OLS trendline when available; otherwise plots without a trendline.
-    """
-    try:
-        import statsmodels.api as _sm  # noqa: F401
-        return px.scatter(df, x="obs", y="pred", trendline="ols", title=title)
-    except Exception:
-        fig = px.scatter(df, x="obs", y="pred", title=title)
-        # Add a simple best-fit line via numpy (no dependencies) if enough points
-        try:
-            if len(df) >= 2:
-                x = df["obs"].astype(float).to_numpy()
-                y = df["pred"].astype(float).to_numpy()
-                import numpy as _np
-                m, b = _np.polyfit(x, y, 1)
-                xline = _np.array([x.min(), x.max()])
-                yline = m * xline + b
-                fig.add_trace(go.Scatter(x=xline, y=yline, mode="lines", name="fit"))
-        except Exception:
-            pass
-        return fig
-
-
-    if x is None:
-        return ""
-    s = str(x).strip().lower()
-    s = re.sub(r"\s+county\s*$", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
 
 import io
 import os
@@ -134,13 +98,75 @@ load_aws_secrets_into_env()
 # Utilities
 # ----------------------------
 
-def normalize_county_name(x: str) -> str:
-    if pd.isna(x):
-        return x
+BASELINE_RUN_DATE = "2026-02-27"
+
+COUNTY_ALIASES = {
+    "st louis": "saint louis",
+    "st. louis": "saint louis",
+}
+
+def normalize_county(x: object) -> str:
+    """Canonical county key used everywhere in the app."""
+    if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
+        return ""
     s = str(x).strip().lower()
-    s = s.replace(" county", "")
-    s = " ".join(s.split())  # collapse repeated whitespace
+    s = re.sub(r"\s+county\s*$", "", s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = COUNTY_ALIASES.get(s, s)
     return s
+
+def normalize_county_name(x: str) -> str:
+    return normalize_county(x)
+
+def prepare_county_year_frame(
+    df: pd.DataFrame,
+    *,
+    county_col: str,
+    year_col: str,
+    value_col: str,
+    value_name: str,
+    keep_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Build a clean county-year dataframe to avoid 87-vs-99 merge issues."""
+    work = df.copy()
+    keep_cols = keep_cols or []
+    work[county_col] = work[county_col].astype(str)
+    work["county_norm"] = work[county_col].map(normalize_county)
+    work["county_display"] = work[county_col].astype(str).str.strip()
+    work[year_col] = pd.to_numeric(work[year_col], errors="coerce")
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    cols = ["county_norm", "county_display", year_col, value_col] + [c for c in keep_cols if c in work.columns]
+    work = work[cols].rename(columns={year_col: "year", value_col: value_name})
+    work = work[(work["county_norm"] != "") & work["year"].notna() & work[value_name].notna()].copy()
+    work["year"] = work["year"].astype(int)
+    agg = {value_name: "mean", "county_display": "first"}
+    for c in keep_cols:
+        if c in work.columns:
+            agg[c] = "first"
+    work = work.groupby(["county_norm", "year"], as_index=False).agg(agg)
+    return work
+
+def plot_obs_pred_scatter(df: pd.DataFrame, title: str):
+    """Observed vs predicted scatter with a dependency-light trendline."""
+    try:
+        import statsmodels.api as _sm  # noqa: F401
+        return px.scatter(df, x="obs", y="pred", trendline="ols", title=title, hover_data=["county_display"])
+    except Exception:
+        fig = px.scatter(df, x="obs", y="pred", title=title, hover_data=["county_display"])
+        try:
+            if len(df) >= 2:
+                x = df["obs"].astype(float).to_numpy()
+                y = df["pred"].astype(float).to_numpy()
+                import numpy as _np
+                m, b = _np.polyfit(x, y, 1)
+                xline = _np.array([x.min(), x.max()])
+                yline = m * xline + b
+                fig.add_trace(go.Scatter(x=xline, y=yline, mode="lines", name="fit"))
+        except Exception:
+            pass
+        return fig
+
 
 def ensure_columns(df: pd.DataFrame, rename_map: dict) -> pd.DataFrame:
     for k, v in rename_map.items():
@@ -371,11 +397,20 @@ def load_predictions_from_predictions_s3(
     # ensure year
     if "year" not in df.columns:
         df["year"] = int(predict_year)
-    df["year"] = df["year"].astype(int)
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").fillna(int(predict_year)).astype(int)
 
-    # ensure county_norm
     if "county" in df.columns:
-        df["county_norm"] = df["county"].map(normalize_county_name)
+        pred_clean = prepare_county_year_frame(
+            df,
+            county_col="county",
+            year_col="year",
+            value_col="prediction",
+            value_name="prediction",
+        )
+        df = pred_clean
+    else:
+        df["county_norm"] = ""
+        df["county_display"] = ""
 
     # attach selection metadata for reporting
     df["feature_season"] = feature_season
@@ -420,6 +455,35 @@ def list_available_run_dates_for_year(
         run_dates.append(rd)
     return sorted(set(run_dates))
 
+
+@st.cache_data(show_spinner=False)
+def list_available_models(
+    region: str,
+    bucket: str,
+    state_fips: str,
+    county_fips: str,
+    feature_season: str,
+    run_date: str,
+    predict_year: int,
+) -> List[str]:
+    """Discover available model folders for the selected season/run date."""
+    prefix = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/"
+        f"county_fips={county_fips}/"
+        f"predict_year={int(predict_year)}/"
+        f"feature_season={feature_season}/"
+        f"run_date={run_date}/"
+    )
+    try:
+        files = s3_list_files_under_prefix(region, prefix, exts=(".parquet", ".parquet.out", ".csv"))
+    except Exception:
+        return []
+    models = set()
+    for f in files:
+        if "/model=" in f:
+            models.add(f.split("/model=")[1].split("/")[0])
+    return sorted(models)
 
 def load_predictions_for_run_dates(
     region: str,
@@ -849,13 +913,26 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Run selection")
     run_date = st.text_input("run_date", value=os.getenv("RUN_DATE", str(date.today())))
-    # Demo logic: use a fixed baseline run_date for historical years, and selected run_date only for TARGET_YEAR
-    baseline_run_date = st.text_input("baseline_run_date (for 2019–2024)", value=os.getenv("BASELINE_RUN_DATE", "2026-02-27"))
+    baseline_run_date = BASELINE_RUN_DATE
     target_year = st.number_input("Target year (uses selected run_date)", min_value=2010, max_value=2100, value=int(os.getenv("TARGET_YEAR", "2025")), step=1)
     default_seasons = ["jun01", "jul01", "jul15", "aug01", "aug15"]
     feature_season = st.selectbox("Season (cutoff)", options=default_seasons, index=0)
 
-    model_name = st.text_input("Model name", value=os.getenv("MODEL_NAME", "Jun01_LightGBM-limited_withstorm"))
+    discovered_models = list_available_models(
+        region=region,
+        bucket=bucket,
+        state_fips=state_fips,
+        county_fips=county_fips,
+        feature_season=feature_season,
+        run_date=run_date,
+        predict_year=int(target_year),
+    )
+    fallback_model = os.getenv("MODEL_NAME", f"{feature_season.capitalize()}_LightGBM-limited_withstorm")
+    model_options = discovered_models or [fallback_model]
+    default_model_index = model_options.index(fallback_model) if fallback_model in model_options else 0
+    model_name = st.selectbox("Model name", options=model_options, index=default_model_index)
+
+    st.caption(f"Historical years 2019–2024 are fixed to baseline run_date: {baseline_run_date}")
 
     st.markdown("---")
     st.subheader("Years")
@@ -943,10 +1020,12 @@ STATEWIDE_KEY = "__statewide__"
 STATEWIDE_LABEL = "Statewide (Iowa)"
 
 county_options: List[str] = []
+county_pool = set()
 if "county_norm" in pred_all.columns:
-    county_options = sorted([c for c in pred_all["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
-elif actuals_df is not None and "county_norm" in actuals_df.columns:
-    county_options = sorted([c for c in actuals_df["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
+    county_pool.update([c for c in pred_all["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
+if actuals_df is not None and "county_norm" in actuals_df.columns:
+    county_pool.update([c for c in actuals_df["county_norm"].dropna().unique().tolist() if str(c).strip() != ""])
+county_options = sorted(county_pool)
 
 # Remove any accidental statewide-like keys from the list (we add a single clean option)
 county_options = [c for c in county_options if str(c).strip().lower() not in {"iowa", "statewide", "all", STATEWIDE_KEY}]
@@ -1155,14 +1234,14 @@ with tab_export:
     }
 
     # Build the chart figure for embedding in HTML/PDF when possible
+    report_title = f"GeoAI Yield Report — {(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {start_year}-{end_year}"
+
     fig = None
     if _HAS_PLOTLY:
         try:
             fig = plot_observed_vs_pred_plotly(series_df, title=report_title)
         except Exception:
             fig = None
-
-    report_title = f"GeoAI Yield Report — {(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {start_year}-{end_year}"
 
     # ---- HTML export (always available) ----
     html_str = build_html_report_str(series_df, title=report_title, params=params, metrics=metrics, fig=fig)
@@ -1222,15 +1301,42 @@ with tab_valueadd:
     st.markdown("#### B) Observed vs Predicted across counties (for a single year)")
     year_for_scatter = st.selectbox("Pick a year for accuracy scatter (needs actuals)", options=[y for y in years if int(y) <= 2024], index=0)
     if actuals_df is not None and "county_norm" in pred_all.columns and "county_norm" in actuals_df.columns:
-        py = pred_all[pred_all["year"] == int(year_for_scatter)].groupby("county_norm", as_index=False)["prediction"].mean().rename(columns={"prediction":"pred"})
-        ay_col = "observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre"
-        ay = actuals_df[actuals_df["year"] == int(year_for_scatter)].groupby("county_norm", as_index=False)[ay_col].mean().rename(columns={ay_col:"obs"})
-        m2 = py.merge(ay, on="county_norm", how="inner")
+        py = prepare_county_year_frame(
+            pred_all[pred_all["year"] == int(year_for_scatter)],
+            county_col="county_display" if "county_display" in pred_all.columns else "county_norm",
+            year_col="year",
+            value_col="prediction",
+            value_name="pred",
+        )
+        ay = prepare_county_year_frame(
+            actuals_df[actuals_df["year"] == int(year_for_scatter)],
+            county_col="county_display" if "county_display" in actuals_df.columns else "county_norm",
+            year_col="year",
+            value_col="observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre",
+            value_name="obs",
+        )
+        m2 = py.merge(ay[["county_norm", "obs"]], on="county_norm", how="inner")
+        m2["county_display"] = m2["county_display"].fillna(m2["county_norm"].str.title())
+        pred_count = int(py["county_norm"].nunique())
+        act_count = int(ay["county_norm"].nunique())
+        overlap_count = int(m2["county_norm"].nunique())
+        missing_from_actuals = sorted(set(py["county_norm"]) - set(ay["county_norm"]))
+        missing_from_predictions = sorted(set(ay["county_norm"]) - set(py["county_norm"]))
         if not m2.empty:
             if _HAS_PLOTLY:
                 figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) - {year_for_scatter}")
                 st.plotly_chart(figs, use_container_width=True)
-            st.write({"counties": int(len(m2)), "RMSE": metric_rmse(m2["obs"], m2["pred"]), "MAE": metric_mae(m2["obs"], m2["pred"]), "R2": metric_r2(m2["obs"], m2["pred"])})
+            st.write({
+                "prediction_counties": pred_count,
+                "actual_counties": act_count,
+                "overlap_counties": overlap_count,
+                "RMSE": metric_rmse(m2["obs"], m2["pred"]),
+                "MAE": metric_mae(m2["obs"], m2["pred"]),
+                "R2": metric_r2(m2["obs"], m2["pred"]),
+            })
+            if pred_count != act_count or overlap_count != pred_count:
+                with st.expander("County overlap debug"):
+                    st.write({"missing_from_actuals": missing_from_actuals, "missing_from_predictions": missing_from_predictions})
         else:
             st.info("Not enough overlap between predictions and actuals for this year.")
     else:
