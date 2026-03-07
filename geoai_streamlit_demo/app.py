@@ -1283,7 +1283,7 @@ if actuals_df is not None and "year" in actuals_df.columns:
         st.info("Provide a State machine ARN in the sidebar to enable triggering.")
 
 
-st.markdown("#### C) 2025 run-date comparison (demo wow view)")
+st.markdown("#### C) 2025 run-date comparison")
 st.caption("Compare how the *2025* prediction changes across different run dates. Great to explain model stability and the impact of new live storm data.")
 
 compare_year = int(target_year)  # default 2025
@@ -1335,7 +1335,13 @@ else:
                 elif pc.empty:
                     st.info("Selected county not found in loaded prediction files.")
 
-                st.markdown("**Stability across counties** (Std Dev of prediction across run_dates)")
+                # st.markdown("**Stability across counties** (Std Dev of prediction across run_dates)")
+                st.markdown("### Stability across counties (Std Dev of prediction across run_dates)")
+
+                st.info(
+                    "Stability analysis requires multiple run_dates. "
+                    "For this demo only a single run_date is available, so the stability view is disabled."
+                )
                 stab = (
                     pr.groupby("county_norm", as_index=False)["prediction"]
                       .agg(std_pred="std", mean_pred="mean", min_pred="min", max_pred="max", n_runs="count")
