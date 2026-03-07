@@ -4,7 +4,7 @@ GeoAI Capstone Demo App (Streamlit) — Updated
 Updates requested by Mohan:
 1) Load predictions from your predictions outputs in S3, e.g.
    s3://geoai-demo-data/predictions/state_fips=<state_fips>/county_fips=ALL/predict_year=<year>/feature_season=<season>/run_date=<run_date>/model=<model>/
-   (supports parquet/csv; searches recursively for a prediction column)
+   (supports parquet/csv, including SageMaker Batch Transform outputs like part.parquet.out; searches recursively for a prediction column)
 2) UI controls: County + Season + Model + Run date + Year range (2020–2025)
 3) "Observed vs Mean Prediction" line chart for 2020–2025 (like your screenshot, but simplified)
 4) Optional: Trigger an AWS Step Functions state machine for the selected (run_date, model, season)
@@ -445,7 +445,12 @@ def list_available_run_dates_for_year(
         f"state_fips={state_fips}/county_fips={county_fips}/predict_year={predict_year}/"
         f"feature_season={feature_season}/run_date={run_date_glob}/model={model_name}/part.parquet.out"
     )
-    matches = fs.glob(pattern1.replace("s3://", "")) + fs.glob(pattern2.replace("s3://", ""))
+    pattern3 = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/county_fips={county_fips}/predict_year={predict_year}/"
+        f"feature_season={feature_season}/run_date={run_date_glob}/model={model_name}/part.parquet"
+    )
+    matches = fs.glob(pattern1.replace("s3://", "")) + fs.glob(pattern2.replace("s3://", "")) + fs.glob(pattern3.replace("s3://", ""))
     run_dates = []
     for m in matches:
         parts = m.split("run_date=")
