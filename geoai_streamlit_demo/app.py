@@ -623,6 +623,55 @@ def load_predictions_for_run_dates(
         out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("int64")
     return out
 
+
+SEASON_TO_MODEL = {
+    "jun01": "Jun01_LightGBM-limited_withstorm",
+    "jul01": "Jul01_LightGBM-limited_withstorm",
+    "aug01": "Aug01_LightGBM-limited_withstorm",
+}
+
+@st.cache_data(show_spinner=False)
+def load_predictions_for_seasons(
+    region: str,
+    bucket: str,
+    state_fips: str,
+    county_fips: str,
+    predict_year: int,
+    run_date_map: Dict[str, str],
+    seasons: List[str],
+) -> pd.DataFrame:
+    """Load one prediction set per season for the target year and attach season/model labels."""
+    frames = []
+    for season in seasons:
+        model_name = SEASON_TO_MODEL.get(season)
+        run_date = str(run_date_map.get(season, "")).strip()
+        if not model_name or not run_date:
+            continue
+        d, _ = load_predictions_from_predictions_s3(
+            region=region,
+            bucket=bucket,
+            state_fips=state_fips,
+            predict_year=int(predict_year),
+            feature_season=season,
+            run_date=run_date,
+            model_name=model_name,
+            county_fips=county_fips,
+        )
+        if d is None or d.empty:
+            continue
+        d = d.copy()
+        d["season_label"] = season.upper()
+        d["season_order"] = {"jun01": 1, "jul01": 2, "aug01": 3}.get(season, 99)
+        frames.append(d)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    if "county_norm" in out.columns:
+        out["county_norm"] = out["county_norm"].astype(str)
+    if "year" in out.columns:
+        out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("int64")
+    return out
+
 @st.cache_data(show_spinner=False)
 def load_actuals(region: str, actuals_uri: str) -> pd.DataFrame:
     df = s3_read_parquet(actuals_uri)
@@ -1054,6 +1103,11 @@ with st.sidebar:
     default_model_index = model_options.index(default_model_name) if default_model_name in model_options else 0
     model_name = st.selectbox("Model name", options=model_options, index=default_model_index)
 
+    st.markdown("#### 2025 season comparison inputs")
+    compare_jun01_run_date = st.text_input("Jun01 run_date (2025 compare)", value=os.getenv("COMPARE_JUN01_RUN_DATE", "2025-06-01"))
+    compare_jul01_run_date = st.text_input("Jul01 run_date (2025 compare)", value=os.getenv("COMPARE_JUL01_RUN_DATE", "2025-07-01"))
+    compare_aug01_run_date = st.text_input("Aug01 run_date (2025 compare)", value=os.getenv("COMPARE_AUG01_RUN_DATE", "2025-08-01"))
+
     st.caption(f"Historical years 2019–2024 are fixed to baseline run_date: {baseline_run_date}")
 
     st.markdown("---")
@@ -1243,8 +1297,59 @@ if actuals_df is not None and "year" in actuals_df.columns:
 
     title = f"Observed vs Mean Prediction — {(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {start_year}-{end_year}"
     if _HAS_PLOTLY:
-        fig = plot_observed_vs_pred_plotly(series_df, title=title)
-        st.plotly_chart(fig, use_container_width=True)
+        season_compare_map = {
+            "jun01": compare_jun01_run_date,
+            "jul01": compare_jul01_run_date,
+            "aug01": compare_aug01_run_date,
+        }
+        season_compare_df = load_predictions_for_seasons(
+            region=region,
+            bucket=bucket,
+            state_fips=state_fips,
+            county_fips=county_fips,
+            predict_year=int(target_year),
+            run_date_map=season_compare_map,
+            seasons=["jun01", "jul01", "aug01"],
+        )
+
+        st.markdown("### 2025 seasonal comparison (Jun01 vs Jul01 vs Aug01)")
+        st.caption("Compares the selected county's 2025 prediction across the three seasonal models using the run_dates you provide in the sidebar.")
+
+        if season_compare_df.empty:
+            st.info("No season-comparison prediction files could be loaded for the provided Jun01/Jul01/Aug01 run_dates.")
+        else:
+            sc = season_compare_df.copy()
+            if county_selected != STATEWIDE_KEY:
+                sc = sc[sc["county_norm"] == county_selected].copy()
+            else:
+                sc = (
+                    sc.groupby(["season_label", "season_order"], as_index=False)["prediction"]
+                      .mean()
+                )
+            sc = sc.sort_values(["season_order", "season_label"]).copy()
+            if not sc.empty:
+                season_fig = go.Figure()
+                season_fig.add_trace(go.Scatter(
+                    x=sc["season_label"],
+                    y=sc["prediction"],
+                    mode="lines+markers",
+                    name=f"{int(target_year)} prediction",
+                    line=dict(width=3),
+                    marker=dict(size=10),
+                ))
+                season_fig.update_layout(
+                    title=f"{(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {int(target_year)} prediction across seasons",
+                    xaxis_title="Season model",
+                    yaxis_title="Predicted yield (bu/acre)",
+                    margin=dict(l=20, r=20, t=50, b=20),
+                )
+                st.plotly_chart(season_fig, use_container_width=True)
+                show_cols = [c for c in ["season_label", "prediction", "run_date", "model_name"] if c in sc.columns]
+                if not show_cols:
+                    show_cols = ["season_label", "prediction"]
+                st.dataframe(sc[show_cols], use_container_width=True)
+            else:
+                st.info("Selected county was not found in one or more of the seasonal prediction files.")
     else:
         st.info("Install plotly for interactive charts: pip install plotly")
 
