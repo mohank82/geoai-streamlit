@@ -314,25 +314,13 @@ def load_predictions_from_predictions_s3(
     county_fips: str = "ALL",
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Reads prediction rows from your *predictions* folder structure, e.g.
+    Reads prediction rows from your *predictions* folder structure.
 
-      s3://geoai-demo-data/predictions/
-        state_fips=19/
-        county_fips=ALL/
-        predict_year=2025/
-        feature_season=jun01/
-        run_date=2026-02-27/
-        model=Jun01_LightGBM-limited_withstorm/
-        predictions.csv
-
-    This function searches recursively for parquet/csv under the *exact* combination prefix.
-
-    Why you saw the error:
-    - The earlier app version was reading *features_frozen* (feature rows), not *predictions*.
-      Those files contain engineered features, so there is no prediction column.
+    It first tries the exact prefix, then falls back to broader searches because
+    SageMaker batch outputs and manual copies sometimes create slight path/name
+    mismatches during demos.
     """
-    # Your S3 layout encodes selections in the path, including `model=<name>`.
-    base_prefix = (
+    exact_prefix = (
         f"s3://{bucket}/predictions/"
         f"state_fips={state_fips}/"
         f"county_fips={county_fips}/"
@@ -341,15 +329,66 @@ def load_predictions_from_predictions_s3(
         f"run_date={run_date}/"
         f"model={model_name}/"
     )
+    run_date_prefix = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/"
+        f"county_fips={county_fips}/"
+        f"predict_year={int(predict_year)}/"
+        f"feature_season={feature_season}/"
+        f"run_date={run_date}/"
+    )
+    season_prefix = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/"
+        f"county_fips={county_fips}/"
+        f"predict_year={int(predict_year)}/"
+        f"feature_season={feature_season}/"
+    )
 
     dbg = {
-        "base_prefix": base_prefix,
+        "base_prefix": exact_prefix,
         "feature_season": feature_season,
         "run_date": run_date,
         "model_name": model_name,
+        "search_strategy": "exact",
     }
 
-    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".parquet.out", ".csv"))
+    exts = (".parquet", ".parquet.out", ".csv")
+    files = s3_list_files_under_prefix(region, exact_prefix, exts=exts)
+
+    def _norm_model(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+    wanted_model_norm = _norm_model(model_name)
+
+    if not files:
+        broader = s3_list_files_under_prefix(region, run_date_prefix, exts=exts)
+        filtered = []
+        for f in broader:
+            if "/model=" in f:
+                model_in_path = f.split("/model=")[1].split("/")[0]
+                if _norm_model(model_in_path) == wanted_model_norm:
+                    filtered.append(f)
+        if filtered:
+            files = filtered
+            dbg["search_strategy"] = "run_date_fallback"
+            dbg["fallback_prefix"] = run_date_prefix
+
+    if not files:
+        broader = s3_list_files_under_prefix(region, season_prefix, exts=exts)
+        filtered = []
+        run_token = f"/run_date={run_date}/"
+        for f in broader:
+            if run_token not in f or "/model=" not in f:
+                continue
+            model_in_path = f.split("/model=")[1].split("/")[0]
+            if _norm_model(model_in_path) == wanted_model_norm:
+                filtered.append(f)
+        if filtered:
+            files = filtered
+            dbg["search_strategy"] = "season_fallback"
+            dbg["fallback_prefix"] = season_prefix
+
     dbg["files_found"] = len(files)
     dbg["files_preview"] = files[:10]
 
@@ -362,21 +401,18 @@ def load_predictions_from_predictions_s3(
         try:
             dfs.append(_read_any_file(f))
         except Exception:
-            # Skip unreadable fragments rather than failing the whole demo
             continue
 
     if not dfs:
-        raise FileNotFoundError(f"Files exist but none were readable under: {base_prefix}")
+        raise FileNotFoundError(f"Files exist but none were readable under: {exact_prefix}")
 
     df = pd.concat(dfs, ignore_index=True)
     df = dedupe_columns(df)
 
-    # normalize key columns
     pred_col = _first_present(list(df.columns), PRED_COL_CANDIDATES)
     if pred_col and pred_col != "prediction":
         df = df.rename(columns={pred_col: "prediction"})
     if "prediction" not in df.columns:
-        # last-resort: if single numeric col, treat it as prediction
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if len(num_cols) == 1:
             df = df.rename(columns={num_cols[0]: "prediction"})
@@ -394,7 +430,6 @@ def load_predictions_from_predictions_s3(
     if year_col and year_col != "year":
         df = df.rename(columns={year_col: "year"})
 
-    # ensure year
     if "year" not in df.columns:
         df["year"] = int(predict_year)
     df["year"] = pd.to_numeric(df["year"], errors="coerce").fillna(int(predict_year)).astype(int)
@@ -412,7 +447,6 @@ def load_predictions_from_predictions_s3(
         df["county_norm"] = ""
         df["county_display"] = ""
 
-    # attach selection metadata for reporting
     df["feature_season"] = feature_season
     df["run_date"] = run_date
     df["model_name"] = model_name
@@ -998,59 +1032,25 @@ def _load_all_years(
     baseline_run_date: str,
     target_year: int,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], List[Dict]]:
-    pred_frames: List[pd.DataFrame] = []
-    dbg_all: List[Dict] = []
-
-    # Historical years always come from the baseline run_date
+    pred_all = []
+    dbg_all = []
     for y in years:
-        y = int(y)
-        if y == int(target_year):
-            continue
-
+        # Demo rule: for historical years (year < target_year) always read predictions from baseline_run_date
+        rd = run_date if int(y) == int(target_year) else baseline_run_date
         d, dbg = load_predictions_from_predictions_s3(
             region=region,
             bucket=bucket,
             state_fips=state_fips,
             county_fips=county_fips,
-            predict_year=y,
+            predict_year=int(y),
             feature_season=feature_season,
-            run_date=baseline_run_date,
+            run_date=rd,
             model_name=model_name,
         )
-        dbg["effective_run_date"] = baseline_run_date
-        dbg["requested_predict_year"] = y
+        pred_all.append(d)
+        dbg["effective_run_date"] = rd
         dbg_all.append(dbg)
-
-        if d is not None and not d.empty:
-            d = d.copy()
-            d["source_run_date"] = baseline_run_date
-            d["year"] = pd.to_numeric(d["year"], errors="coerce").fillna(y).astype(int)
-            d = d[d["year"] == y].copy()
-            pred_frames.append(d)
-
-    # Target year always comes from the selected run_date
-    d_target, dbg_target = load_predictions_from_predictions_s3(
-        region=region,
-        bucket=bucket,
-        state_fips=state_fips,
-        county_fips=county_fips,
-        predict_year=int(target_year),
-        feature_season=feature_season,
-        run_date=run_date,
-        model_name=model_name,
-    )
-    dbg_target["effective_run_date"] = run_date
-    dbg_target["requested_predict_year"] = int(target_year)
-    dbg_all.append(dbg_target)
-
-    if d_target is not None and not d_target.empty:
-        d_target = d_target.copy()
-        d_target["source_run_date"] = run_date
-        d_target["year"] = pd.to_numeric(d_target["year"], errors="coerce").fillna(int(target_year)).astype(int)
-        d_target = d_target[d_target["year"] == int(target_year)].copy()
-        pred_frames.append(d_target)
-
-    pred_all = pd.concat(pred_frames, ignore_index=True) if pred_frames else pd.DataFrame()
+    pred_all = pd.concat(pred_all, ignore_index=True)
 
     # actuals (optional but recommended)
     actuals_df = None
