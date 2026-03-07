@@ -998,25 +998,59 @@ def _load_all_years(
     baseline_run_date: str,
     target_year: int,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], List[Dict]]:
-    pred_all = []
-    dbg_all = []
+    pred_frames: List[pd.DataFrame] = []
+    dbg_all: List[Dict] = []
+
+    # Historical years always come from the baseline run_date
     for y in years:
-        # Demo rule: for historical years (year < target_year) always read predictions from baseline_run_date
-        rd = run_date if int(y) == int(target_year) else baseline_run_date
+        y = int(y)
+        if y == int(target_year):
+            continue
+
         d, dbg = load_predictions_from_predictions_s3(
             region=region,
             bucket=bucket,
             state_fips=state_fips,
             county_fips=county_fips,
-            predict_year=int(y),
+            predict_year=y,
             feature_season=feature_season,
-            run_date=rd,
+            run_date=baseline_run_date,
             model_name=model_name,
         )
-        pred_all.append(d)
-        dbg["effective_run_date"] = rd
+        dbg["effective_run_date"] = baseline_run_date
+        dbg["requested_predict_year"] = y
         dbg_all.append(dbg)
-    pred_all = pd.concat(pred_all, ignore_index=True)
+
+        if d is not None and not d.empty:
+            d = d.copy()
+            d["source_run_date"] = baseline_run_date
+            d["year"] = pd.to_numeric(d["year"], errors="coerce").fillna(y).astype(int)
+            d = d[d["year"] == y].copy()
+            pred_frames.append(d)
+
+    # Target year always comes from the selected run_date
+    d_target, dbg_target = load_predictions_from_predictions_s3(
+        region=region,
+        bucket=bucket,
+        state_fips=state_fips,
+        county_fips=county_fips,
+        predict_year=int(target_year),
+        feature_season=feature_season,
+        run_date=run_date,
+        model_name=model_name,
+    )
+    dbg_target["effective_run_date"] = run_date
+    dbg_target["requested_predict_year"] = int(target_year)
+    dbg_all.append(dbg_target)
+
+    if d_target is not None and not d_target.empty:
+        d_target = d_target.copy()
+        d_target["source_run_date"] = run_date
+        d_target["year"] = pd.to_numeric(d_target["year"], errors="coerce").fillna(int(target_year)).astype(int)
+        d_target = d_target[d_target["year"] == int(target_year)].copy()
+        pred_frames.append(d_target)
+
+    pred_all = pd.concat(pred_frames, ignore_index=True) if pred_frames else pd.DataFrame()
 
     # actuals (optional but recommended)
     actuals_df = None
