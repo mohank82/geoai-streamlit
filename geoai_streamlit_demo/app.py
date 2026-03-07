@@ -4,7 +4,7 @@ GeoAI Capstone Demo App (Streamlit) — Updated
 Updates requested by Mohan:
 1) Load predictions from your predictions outputs in S3, e.g.
    s3://geoai-demo-data/predictions/state_fips=<state_fips>/county_fips=ALL/predict_year=<year>/feature_season=<season>/run_date=<run_date>/model=<model>/
-   (supports parquet/csv; searches recursively for a prediction column)
+   (supports parquet/csv, including SageMaker Batch Transform outputs like part.parquet.out; searches recursively for a prediction column)
 2) UI controls: County + Season + Model + Run date + Year range (2020–2025)
 3) "Observed vs Mean Prediction" line chart for 2020–2025 (like your screenshot, but simplified)
 4) Optional: Trigger an AWS Step Functions state machine for the selected (run_date, model, season)
@@ -251,21 +251,6 @@ def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".par
             break
     return sorted(out)
 
-@st.cache_data(show_spinner=False)
-def s3_read_parquet(uri: str) -> pd.DataFrame:
-    _require_aws()
-    # Read parquet regardless of suffix (e.g., SageMaker Batch Transform 'part.parquet.out')
-    fs = s3fs.S3FileSystem()
-    with fs.open(uri, "rb") as f:
-        table = pq.read_table(f)
-    return table.to_pandas()
-
-@st.cache_data(show_spinner=False)
-def s3_read_csv(uri: str, header: Optional[int] = "infer") -> pd.DataFrame:
-    _require_aws()
-    return pd.read_csv(uri, header=header)
-
-
 
 def s3_object_exists(region: str, uri: str) -> bool:
     _require_aws()
@@ -309,8 +294,7 @@ def find_prediction_files_exact_first(
         base_prefix + "predictions.csv",
         base_prefix + "part.csv",
     ]
-
-    exact_found = [u for u in exact_candidates if s3_object_exists(region, u)]
+    exact_found = [p for p in exact_candidates if s3_object_exists(region, p)]
     if exact_found:
         return exact_found, "exact_file_probe"
 
@@ -319,6 +303,20 @@ def find_prediction_files_exact_first(
         return files, "prefix_list"
 
     return [], "not_found"
+
+@st.cache_data(show_spinner=False)
+def s3_read_parquet(uri: str) -> pd.DataFrame:
+    _require_aws()
+    # Read parquet regardless of suffix (e.g., SageMaker Batch Transform 'part.parquet.out')
+    fs = s3fs.S3FileSystem()
+    with fs.open(uri, "rb") as f:
+        table = pq.read_table(f)
+    return table.to_pandas()
+
+@st.cache_data(show_spinner=False)
+def s3_read_csv(uri: str, header: Optional[int] = "infer") -> pd.DataFrame:
+    _require_aws()
+    return pd.read_csv(uri, header=header)
 
 def _read_any_file(path_or_s3uri: str) -> pd.DataFrame:
     p = path_or_s3uri.lower()
@@ -369,25 +367,13 @@ def load_predictions_from_predictions_s3(
     county_fips: str = "ALL",
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Reads prediction rows from your *predictions* folder structure, e.g.
+    Reads prediction rows from your *predictions* folder structure.
 
-      s3://geoai-demo-data/predictions/
-        state_fips=19/
-        county_fips=ALL/
-        predict_year=2025/
-        feature_season=jun01/
-        run_date=2026-02-27/
-        model=Jun01_LightGBM-limited_withstorm/
-        predictions.csv
-
-    This function searches recursively for parquet/csv under the *exact* combination prefix.
-
-    Why you saw the error:
-    - The earlier app version was reading *features_frozen* (feature rows), not *predictions*.
-      Those files contain engineered features, so there is no prediction column.
+    It first tries the exact prefix, then falls back to broader searches because
+    SageMaker batch outputs and manual copies sometimes create slight path/name
+    mismatches during demos.
     """
-    # Your S3 layout encodes selections in the path, including `model=<name>`.
-    base_prefix = (
+    exact_prefix = (
         f"s3://{bucket}/predictions/"
         f"state_fips={state_fips}/"
         f"county_fips={county_fips}/"
@@ -396,15 +382,32 @@ def load_predictions_from_predictions_s3(
         f"run_date={run_date}/"
         f"model={model_name}/"
     )
+    run_date_prefix = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/"
+        f"county_fips={county_fips}/"
+        f"predict_year={int(predict_year)}/"
+        f"feature_season={feature_season}/"
+        f"run_date={run_date}/"
+    )
+    season_prefix = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/"
+        f"county_fips={county_fips}/"
+        f"predict_year={int(predict_year)}/"
+        f"feature_season={feature_season}/"
+    )
 
     dbg = {
-        "base_prefix": base_prefix,
+        "base_prefix": exact_prefix,
         "feature_season": feature_season,
         "run_date": run_date,
         "model_name": model_name,
+        "search_strategy": "exact",
     }
 
-    files, search_strategy = find_prediction_files_exact_first(
+    exts = (".parquet", ".parquet.out", ".csv", ".out")
+    files, exact_strategy = find_prediction_files_exact_first(
         region=region,
         bucket=bucket,
         state_fips=state_fips,
@@ -414,7 +417,41 @@ def load_predictions_from_predictions_s3(
         run_date=run_date,
         model_name=model_name,
     )
-    dbg["search_strategy"] = search_strategy
+    dbg["search_strategy"] = exact_strategy
+
+    def _norm_model(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+    wanted_model_norm = _norm_model(model_name)
+
+    if not files:
+        broader = s3_list_files_under_prefix(region, run_date_prefix, exts=exts)
+        filtered = []
+        for f in broader:
+            if "/model=" in f:
+                model_in_path = f.split("/model=")[1].split("/")[0]
+                if _norm_model(model_in_path) == wanted_model_norm:
+                    filtered.append(f)
+        if filtered:
+            files = filtered
+            dbg["search_strategy"] = "run_date_fallback"
+            dbg["fallback_prefix"] = run_date_prefix
+
+    if not files:
+        broader = s3_list_files_under_prefix(region, season_prefix, exts=exts)
+        filtered = []
+        run_token = f"/run_date={run_date}/"
+        for f in broader:
+            if run_token not in f or "/model=" not in f:
+                continue
+            model_in_path = f.split("/model=")[1].split("/")[0]
+            if _norm_model(model_in_path) == wanted_model_norm:
+                filtered.append(f)
+        if filtered:
+            files = filtered
+            dbg["search_strategy"] = "season_fallback"
+            dbg["fallback_prefix"] = season_prefix
+
     dbg["files_found"] = len(files)
     dbg["files_preview"] = files[:10]
 
@@ -427,21 +464,18 @@ def load_predictions_from_predictions_s3(
         try:
             dfs.append(_read_any_file(f))
         except Exception:
-            # Skip unreadable fragments rather than failing the whole demo
             continue
 
     if not dfs:
-        raise FileNotFoundError(f"Files exist but none were readable under: {base_prefix}")
+        raise FileNotFoundError(f"Files exist but none were readable under: {exact_prefix}")
 
     df = pd.concat(dfs, ignore_index=True)
     df = dedupe_columns(df)
 
-    # normalize key columns
     pred_col = _first_present(list(df.columns), PRED_COL_CANDIDATES)
     if pred_col and pred_col != "prediction":
         df = df.rename(columns={pred_col: "prediction"})
     if "prediction" not in df.columns:
-        # last-resort: if single numeric col, treat it as prediction
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if len(num_cols) == 1:
             df = df.rename(columns={num_cols[0]: "prediction"})
@@ -459,7 +493,6 @@ def load_predictions_from_predictions_s3(
     if year_col and year_col != "year":
         df = df.rename(columns={year_col: "year"})
 
-    # ensure year
     if "year" not in df.columns:
         df["year"] = int(predict_year)
     df["year"] = pd.to_numeric(df["year"], errors="coerce").fillna(int(predict_year)).astype(int)
@@ -477,7 +510,6 @@ def load_predictions_from_predictions_s3(
         df["county_norm"] = ""
         df["county_display"] = ""
 
-    # attach selection metadata for reporting
     df["feature_season"] = feature_season
     df["run_date"] = run_date
     df["model_name"] = model_name
@@ -510,7 +542,12 @@ def list_available_run_dates_for_year(
         f"state_fips={state_fips}/county_fips={county_fips}/predict_year={predict_year}/"
         f"feature_season={feature_season}/run_date={run_date_glob}/model={model_name}/part.parquet.out"
     )
-    matches = fs.glob(pattern1.replace("s3://", "")) + fs.glob(pattern2.replace("s3://", ""))
+    pattern3 = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/county_fips={county_fips}/predict_year={predict_year}/"
+        f"feature_season={feature_season}/run_date={run_date_glob}/model={model_name}/part.parquet"
+    )
+    matches = fs.glob(pattern1.replace("s3://", "")) + fs.glob(pattern2.replace("s3://", "")) + fs.glob(pattern3.replace("s3://", ""))
     run_dates = []
     for m in matches:
         parts = m.split("run_date=")
@@ -724,15 +761,37 @@ def build_observed_vs_pred_series(
 
 def plot_observed_vs_pred_plotly(df: pd.DataFrame, title: str):
     fig = go.Figure()
+
     fig.add_trace(go.Scatter(
-        x=df["year"], y=df["mean_prediction"], mode="lines+markers",
-        name="Mean Prediction"
+        x=df["year"],
+        y=df["mean_prediction"],
+        mode="lines+markers",
+        name="Mean Prediction",
+        line=dict(color="orange", width=3),
+        marker=dict(color="orange", size=8),
     ))
+
     if df["observed_yield"].notna().any():
         fig.add_trace(go.Scatter(
-            x=df["year"], y=df["observed_yield"], mode="lines+markers",
-            name="Observed Yield"
+            x=df["year"],
+            y=df["observed_yield"],
+            mode="lines+markers",
+            name="Observed Yield",
+            line=dict(color="#1f77b4", width=3),
+            marker=dict(color="#1f77b4", size=8),
         ))
+
+    pred_2025 = df[(pd.to_numeric(df["year"], errors="coerce") == 2025) & df["mean_prediction"].notna()].copy()
+    if not pred_2025.empty:
+        fig.add_trace(go.Scatter(
+            x=pred_2025["year"],
+            y=pred_2025["mean_prediction"],
+            mode="markers",
+            name="2025 Prediction",
+            marker=dict(color="red", size=14, symbol="diamond"),
+            hovertemplate="Year=%{x}<br>Prediction=%{y:.2f}<extra></extra>",
+        ))
+
     fig.update_layout(
         title=title,
         xaxis_title="Year",
@@ -751,9 +810,12 @@ def fig_to_png_bytes_matplotlib(df: pd.DataFrame, title: str) -> bytes:
         raise RuntimeError("matplotlib is required for PDF export plot rendering.")
 
     fig, ax = plt.subplots(figsize=(8.5, 3.7))
-    ax.plot(df["year"], df["mean_prediction"], marker="o", label="Mean Prediction")
+    ax.plot(df["year"], df["mean_prediction"], marker="o", label="Mean Prediction", color="orange")
     if df["observed_yield"].notna().any():
-        ax.plot(df["year"], df["observed_yield"], marker="o", label="Observed Yield")
+        ax.plot(df["year"], df["observed_yield"], marker="o", label="Observed Yield", color="#1f77b4")
+    pred_2025 = df[(pd.to_numeric(df["year"], errors="coerce") == 2025) & df["mean_prediction"].notna()].copy()
+    if not pred_2025.empty:
+        ax.scatter(pred_2025["year"], pred_2025["mean_prediction"], color="red", s=80, marker="D", label="2025 Prediction")
     ax.set_title(title)
     ax.set_xlabel("Year")
     ax.set_ylabel("Yield (bu/acre)")
@@ -977,24 +1039,19 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Run selection")
-    run_date = st.text_input("run_date", value=os.getenv("RUN_DATE", str(date.today())))
+    run_date = st.text_input("run_date", value=os.getenv("RUN_DATE", ""), placeholder="Select or enter run date")
     baseline_run_date = BASELINE_RUN_DATE
     target_year = st.number_input("Target year (uses selected run_date)", min_value=2010, max_value=2100, value=int(os.getenv("TARGET_YEAR", "2025")), step=1)
     default_seasons = ["jun01", "jul01", "jul15", "aug01", "aug15"]
     feature_season = st.selectbox("Season (cutoff)", options=default_seasons, index=0)
 
-    discovered_models = list_available_models(
-        region=region,
-        bucket=bucket,
-        state_fips=state_fips,
-        county_fips=county_fips,
-        feature_season=feature_season,
-        run_date=run_date,
-        predict_year=int(target_year),
-    )
-    fallback_model = os.getenv("MODEL_NAME", f"{feature_season.capitalize()}_LightGBM-limited_withstorm")
-    model_options = discovered_models or [fallback_model]
-    default_model_index = model_options.index(fallback_model) if fallback_model in model_options else 0
+    model_options = [
+        "Jun01_LightGBM-limited_withstorm",
+        "Jul01_LightGBM-limited_withstorm",
+        "Aug01_LightGBM-limited_withstorm",
+    ]
+    default_model_name = os.getenv("MODEL_NAME", "Aug01_LightGBM-limited_withstorm")
+    default_model_index = model_options.index(default_model_name) if default_model_name in model_options else 0
     model_name = st.selectbox("Model name", options=model_options, index=default_model_index)
 
     st.caption(f"Historical years 2019–2024 are fixed to baseline run_date: {baseline_run_date}")
@@ -1103,7 +1160,7 @@ if not county_options:
     )
     county_selected = None
 else:
-    options = [STATEWIDE_KEY] + county_options
+    options = county_options + [STATEWIDE_KEY]
 
     def _county_label(x: str) -> str:
         return STATEWIDE_LABEL if x == STATEWIDE_KEY else str(x).title()
