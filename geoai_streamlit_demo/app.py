@@ -1448,47 +1448,47 @@ with tab_valueadd:
     else:
         st.info("Predictions missing county identifiers; distribution view disabled.")
 
-    st.markdown("#### B) Observed vs Predicted across counties (for a single year)")
-    year_for_scatter = st.selectbox("Pick a year for accuracy scatter (needs actuals)", options=[y for y in years if int(y) <= 2024], index=0)
-    if actuals_df is not None and "county_norm" in pred_all.columns and "county_norm" in actuals_df.columns:
-        py = prepare_county_year_frame(
-            pred_all[pred_all["year"] == int(year_for_scatter)],
-            county_col="county_display" if "county_display" in pred_all.columns else "county_norm",
-            year_col="year",
-            value_col="prediction",
-            value_name="pred",
-        )
-        ay = prepare_county_year_frame(
-            actuals_df[actuals_df["year"] == int(year_for_scatter)],
-            county_col="county_display" if "county_display" in actuals_df.columns else "county_norm",
-            year_col="year",
-            value_col="observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre",
-            value_name="obs",
-        )
-        m2 = py.merge(ay[["county_norm", "obs"]], on="county_norm", how="inner")
-        m2["county_display"] = m2["county_display"].fillna(m2["county_norm"].str.title())
-        pred_count = int(py["county_norm"].nunique())
-        act_count = int(ay["county_norm"].nunique())
-        overlap_count = int(m2["county_norm"].nunique())
-        missing_from_actuals = sorted(set(py["county_norm"]) - set(ay["county_norm"]))
-        missing_from_predictions = sorted(set(ay["county_norm"]) - set(py["county_norm"]))
-        if not m2.empty:
-            if _HAS_PLOTLY:
-                figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) - {year_for_scatter}")
-                st.plotly_chart(figs, use_container_width=True)
-            st.write({
-                "prediction_counties": pred_count,
-                "actual_counties": act_count,
-                "overlap_counties": overlap_count,
-                "RMSE": metric_rmse(m2["obs"], m2["pred"]),
-                "MAE": metric_mae(m2["obs"], m2["pred"]),
-                "R2": metric_r2(m2["obs"], m2["pred"]),
-            })
-            if pred_count != act_count or overlap_count != pred_count:
-                with st.expander("County overlap debug"):
-                    st.write({"missing_from_actuals": missing_from_actuals, "missing_from_predictions": missing_from_predictions})
-        else:
-            st.info("Not enough overlap between predictions and actuals for this year.")
+    # st.markdown("#### B) Observed vs Predicted across counties (for a single year)")
+    # year_for_scatter = st.selectbox("Pick a year for accuracy scatter (needs actuals)", options=[y for y in years if int(y) <= 2024], index=0)
+    # if actuals_df is not None and "county_norm" in pred_all.columns and "county_norm" in actuals_df.columns:
+    #     py = prepare_county_year_frame(
+    #         pred_all[pred_all["year"] == int(year_for_scatter)],
+    #         county_col="county_display" if "county_display" in pred_all.columns else "county_norm",
+    #         year_col="year",
+    #         value_col="prediction",
+    #         value_name="pred",
+    #     )
+    #     ay = prepare_county_year_frame(
+    #         actuals_df[actuals_df["year"] == int(year_for_scatter)],
+    #         county_col="county_display" if "county_display" in actuals_df.columns else "county_norm",
+    #         year_col="year",
+    #         value_col="observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre",
+    #         value_name="obs",
+    #     )
+    #     m2 = py.merge(ay[["county_norm", "obs"]], on="county_norm", how="inner")
+    #     m2["county_display"] = m2["county_display"].fillna(m2["county_norm"].str.title())
+    #     pred_count = int(py["county_norm"].nunique())
+    #     act_count = int(ay["county_norm"].nunique())
+    #     overlap_count = int(m2["county_norm"].nunique())
+    #     missing_from_actuals = sorted(set(py["county_norm"]) - set(ay["county_norm"]))
+    #     missing_from_predictions = sorted(set(ay["county_norm"]) - set(py["county_norm"]))
+    #     if not m2.empty:
+    #         if _HAS_PLOTLY:
+    #             figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) - {year_for_scatter}")
+    #             st.plotly_chart(figs, use_container_width=True)
+    #         st.write({
+    #             "prediction_counties": pred_count,
+    #             "actual_counties": act_count,
+    #             "overlap_counties": overlap_count,
+    #             "RMSE": metric_rmse(m2["obs"], m2["pred"]),
+    #             "MAE": metric_mae(m2["obs"], m2["pred"]),
+    #             "R2": metric_r2(m2["obs"], m2["pred"]),
+    #         })
+    #         if pred_count != act_count or overlap_count != pred_count:
+    #             with st.expander("County overlap debug"):
+    #                 st.write({"missing_from_actuals": missing_from_actuals, "missing_from_predictions": missing_from_predictions})
+    #     else:
+    #         st.info("Not enough overlap between predictions and actuals for this year.")
     else:
         st.info("Actuals or county keys missing; scatter view disabled.")
 
