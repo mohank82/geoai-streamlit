@@ -277,6 +277,7 @@ def find_prediction_files_exact_first(
     run_date: str,
     model_name: str,
 ) -> Tuple[List[str], str]:
+    """Find prediction files robustly, even when the exact folder lookup is brittle."""
     base_prefix = (
         f"s3://{bucket}/predictions/"
         f"state_fips={state_fips}/"
@@ -294,13 +295,47 @@ def find_prediction_files_exact_first(
         base_prefix + "predictions.csv",
         base_prefix + "part.csv",
     ]
-    exact_found = [p for p in exact_candidates if s3_object_exists(region, p)]
+    exact_found = [u for u in exact_candidates if s3_object_exists(region, u)]
     if exact_found:
-        return exact_found, "exact_file_probe"
+        return sorted(set(exact_found)), "exact_file_probe"
 
-    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".parquet.out", ".csv", ".out"))
+    exts = (".parquet", ".parquet.out", ".csv", ".out")
+    files = s3_list_files_under_prefix(region, base_prefix, exts=exts)
     if files:
-        return files, "prefix_list"
+        return sorted(set(files)), "prefix_list"
+
+    # Broad fallback: search at predict_year level and filter by season/run_date/model tokens.
+    broad_prefix = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/"
+        f"county_fips={county_fips}/"
+        f"predict_year={int(predict_year)}/"
+    )
+    try:
+        broader = s3_list_files_under_prefix(region, broad_prefix, exts=exts)
+    except Exception:
+        broader = []
+
+    def _norm_model(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+    wanted_model_norm = _norm_model(model_name)
+    run_token = f"/run_date={run_date}/"
+    season_token = f"/feature_season={feature_season}/"
+    filtered: List[str] = []
+    for f in broader:
+        if season_token not in f or run_token not in f or "/model=" not in f:
+            continue
+        model_in_path = f.split("/model=")[1].split("/")[0]
+        if _norm_model(model_in_path) == wanted_model_norm:
+            filtered.append(f)
+    if filtered:
+        return sorted(set(filtered)), "predict_year_broad_fallback"
+
+    # Last resort: return any files for the exact run_date+season under the year.
+    relaxed = [f for f in broader if season_token in f and run_token in f]
+    if relaxed:
+        return sorted(set(relaxed)), "predict_year_relaxed_fallback"
 
     return [], "not_found"
 
