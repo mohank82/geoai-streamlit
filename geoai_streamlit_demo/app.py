@@ -1489,8 +1489,8 @@ with tab_valueadd:
     #                 st.write({"missing_from_actuals": missing_from_actuals, "missing_from_predictions": missing_from_predictions})
     #     else:
     #         st.info("Not enough overlap between predictions and actuals for this year.")
-    else:
-        st.info("Actuals or county keys missing; scatter view disabled.")
+    # else:
+    #     st.info("Actuals or county keys missing; scatter view disabled.")
 
     if county_selected is None:
         st.stop()
