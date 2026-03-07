@@ -659,15 +659,37 @@ def build_observed_vs_pred_series(
 
 def plot_observed_vs_pred_plotly(df: pd.DataFrame, title: str):
     fig = go.Figure()
+
     fig.add_trace(go.Scatter(
-        x=df["year"], y=df["mean_prediction"], mode="lines+markers",
-        name="Mean Prediction"
+        x=df["year"],
+        y=df["mean_prediction"],
+        mode="lines+markers",
+        name="Mean Prediction",
+        line=dict(color="orange", width=3),
+        marker=dict(color="orange", size=8),
     ))
+
     if df["observed_yield"].notna().any():
         fig.add_trace(go.Scatter(
-            x=df["year"], y=df["observed_yield"], mode="lines+markers",
-            name="Observed Yield"
+            x=df["year"],
+            y=df["observed_yield"],
+            mode="lines+markers",
+            name="Observed Yield",
+            line=dict(color="#1f77b4", width=3),
+            marker=dict(color="#1f77b4", size=8),
         ))
+
+    pred_2025 = df[(pd.to_numeric(df["year"], errors="coerce") == 2025) & df["mean_prediction"].notna()].copy()
+    if not pred_2025.empty:
+        fig.add_trace(go.Scatter(
+            x=pred_2025["year"],
+            y=pred_2025["mean_prediction"],
+            mode="markers",
+            name="2025 Prediction",
+            marker=dict(color="red", size=14, symbol="diamond"),
+            hovertemplate="Year=%{x}<br>Prediction=%{y:.2f}<extra></extra>",
+        ))
+
     fig.update_layout(
         title=title,
         xaxis_title="Year",
@@ -686,9 +708,12 @@ def fig_to_png_bytes_matplotlib(df: pd.DataFrame, title: str) -> bytes:
         raise RuntimeError("matplotlib is required for PDF export plot rendering.")
 
     fig, ax = plt.subplots(figsize=(8.5, 3.7))
-    ax.plot(df["year"], df["mean_prediction"], marker="o", label="Mean Prediction")
+    ax.plot(df["year"], df["mean_prediction"], marker="o", label="Mean Prediction", color="orange")
     if df["observed_yield"].notna().any():
-        ax.plot(df["year"], df["observed_yield"], marker="o", label="Observed Yield")
+        ax.plot(df["year"], df["observed_yield"], marker="o", label="Observed Yield", color="#1f77b4")
+    pred_2025 = df[(pd.to_numeric(df["year"], errors="coerce") == 2025) & df["mean_prediction"].notna()].copy()
+    if not pred_2025.empty:
+        ax.scatter(pred_2025["year"], pred_2025["mean_prediction"], color="red", s=80, marker="D", label="2025 Prediction")
     ax.set_title(title)
     ax.set_xlabel("Year")
     ax.set_ylabel("Yield (bu/acre)")
@@ -912,24 +937,19 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Run selection")
-    run_date = st.text_input("run_date", value=os.getenv("RUN_DATE", str(date.today())))
+    run_date = st.text_input("run_date", value=os.getenv("RUN_DATE", ""), placeholder="Select or enter run date")
     baseline_run_date = BASELINE_RUN_DATE
     target_year = st.number_input("Target year (uses selected run_date)", min_value=2010, max_value=2100, value=int(os.getenv("TARGET_YEAR", "2025")), step=1)
     default_seasons = ["jun01", "jul01", "jul15", "aug01", "aug15"]
     feature_season = st.selectbox("Season (cutoff)", options=default_seasons, index=0)
 
-    discovered_models = list_available_models(
-        region=region,
-        bucket=bucket,
-        state_fips=state_fips,
-        county_fips=county_fips,
-        feature_season=feature_season,
-        run_date=run_date,
-        predict_year=int(target_year),
-    )
-    fallback_model = os.getenv("MODEL_NAME", f"{feature_season.capitalize()}_LightGBM-limited_withstorm")
-    model_options = discovered_models or [fallback_model]
-    default_model_index = model_options.index(fallback_model) if fallback_model in model_options else 0
+    model_options = [
+        "Jun01_LightGBM-limited_withstorm",
+        "Jul01_LightGBM-limited_withstorm",
+        "Aug01_LightGBM-limited_withstorm",
+    ]
+    default_model_name = os.getenv("MODEL_NAME", "Aug01_LightGBM-limited_withstorm")
+    default_model_index = model_options.index(default_model_name) if default_model_name in model_options else 0
     model_name = st.selectbox("Model name", options=model_options, index=default_model_index)
 
     st.caption(f"Historical years 2019–2024 are fixed to baseline run_date: {baseline_run_date}")
@@ -1038,7 +1058,7 @@ if not county_options:
     )
     county_selected = None
 else:
-    options = [STATEWIDE_KEY] + county_options
+    options = county_options + [STATEWIDE_KEY]
 
     def _county_label(x: str) -> str:
         return STATEWIDE_LABEL if x == STATEWIDE_KEY else str(x).title()
