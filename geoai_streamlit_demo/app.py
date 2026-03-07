@@ -251,6 +251,59 @@ def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".par
             break
     return sorted(out)
 
+
+def s3_object_exists(region: str, uri: str) -> bool:
+    _require_aws()
+    u = urlparse(uri)
+    if u.scheme != "s3":
+        return False
+    s3 = _s3_client(region)
+    bucket = u.netloc
+    key = u.path.lstrip("/")
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def find_prediction_files_exact_first(
+    region: str,
+    bucket: str,
+    state_fips: str,
+    county_fips: str,
+    predict_year: int,
+    feature_season: str,
+    run_date: str,
+    model_name: str,
+) -> Tuple[List[str], str]:
+    base_prefix = (
+        f"s3://{bucket}/predictions/"
+        f"state_fips={state_fips}/"
+        f"county_fips={county_fips}/"
+        f"predict_year={int(predict_year)}/"
+        f"feature_season={feature_season}/"
+        f"run_date={run_date}/"
+        f"model={model_name}/"
+    )
+
+    exact_candidates = [
+        base_prefix + "part.parquet.out",
+        base_prefix + "part.parquet",
+        base_prefix + "predictions.parquet",
+        base_prefix + "predictions.csv",
+        base_prefix + "part.csv",
+    ]
+    exact_found = [p for p in exact_candidates if s3_object_exists(region, p)]
+    if exact_found:
+        return exact_found, "exact_file_probe"
+
+    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".parquet.out", ".csv", ".out"))
+    if files:
+        return files, "prefix_list"
+
+    return [], "not_found"
+
 @st.cache_data(show_spinner=False)
 def s3_read_parquet(uri: str) -> pd.DataFrame:
     _require_aws()
@@ -353,8 +406,18 @@ def load_predictions_from_predictions_s3(
         "search_strategy": "exact",
     }
 
-    exts = (".parquet", ".parquet.out", ".csv")
-    files = s3_list_files_under_prefix(region, exact_prefix, exts=exts)
+    exts = (".parquet", ".parquet.out", ".csv", ".out")
+    files, exact_strategy = find_prediction_files_exact_first(
+        region=region,
+        bucket=bucket,
+        state_fips=state_fips,
+        county_fips=county_fips,
+        predict_year=int(predict_year),
+        feature_season=feature_season,
+        run_date=run_date,
+        model_name=model_name,
+    )
+    dbg["search_strategy"] = exact_strategy
 
     def _norm_model(s: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", str(s).lower())
