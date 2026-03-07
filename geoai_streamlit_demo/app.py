@@ -251,59 +251,6 @@ def s3_list_files_under_prefix(region: str, prefix: str, exts=(".parquet", ".par
             break
     return sorted(out)
 
-
-def s3_object_exists(region: str, uri: str) -> bool:
-    _require_aws()
-    u = urlparse(uri)
-    if u.scheme != "s3":
-        return False
-    s3 = _s3_client(region)
-    bucket = u.netloc
-    key = u.path.lstrip("/")
-    try:
-        s3.head_object(Bucket=bucket, Key=key)
-        return True
-    except Exception:
-        return False
-
-
-def find_prediction_files_exact_first(
-    region: str,
-    bucket: str,
-    state_fips: str,
-    county_fips: str,
-    predict_year: int,
-    feature_season: str,
-    run_date: str,
-    model_name: str,
-) -> Tuple[List[str], str]:
-    base_prefix = (
-        f"s3://{bucket}/predictions/"
-        f"state_fips={state_fips}/"
-        f"county_fips={county_fips}/"
-        f"predict_year={int(predict_year)}/"
-        f"feature_season={feature_season}/"
-        f"run_date={run_date}/"
-        f"model={model_name}/"
-    )
-
-    exact_candidates = [
-        base_prefix + "part.parquet.out",
-        base_prefix + "part.parquet",
-        base_prefix + "predictions.parquet",
-        base_prefix + "predictions.csv",
-        base_prefix + "part.csv",
-    ]
-    exact_found = [p for p in exact_candidates if s3_object_exists(region, p)]
-    if exact_found:
-        return exact_found, "exact_file_probe"
-
-    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".parquet.out", ".csv", ".out"))
-    if files:
-        return files, "prefix_list"
-
-    return [], "not_found"
-
 @st.cache_data(show_spinner=False)
 def s3_read_parquet(uri: str) -> pd.DataFrame:
     _require_aws()
@@ -367,13 +314,25 @@ def load_predictions_from_predictions_s3(
     county_fips: str = "ALL",
 ) -> Tuple[pd.DataFrame, Dict]:
     """
-    Reads prediction rows from your *predictions* folder structure.
+    Reads prediction rows from your *predictions* folder structure, e.g.
 
-    It first tries the exact prefix, then falls back to broader searches because
-    SageMaker batch outputs and manual copies sometimes create slight path/name
-    mismatches during demos.
+      s3://geoai-demo-data/predictions/
+        state_fips=19/
+        county_fips=ALL/
+        predict_year=2025/
+        feature_season=jun01/
+        run_date=2026-02-27/
+        model=Jun01_LightGBM-limited_withstorm/
+        predictions.csv
+
+    This function searches recursively for parquet/csv under the *exact* combination prefix.
+
+    Why you saw the error:
+    - The earlier app version was reading *features_frozen* (feature rows), not *predictions*.
+      Those files contain engineered features, so there is no prediction column.
     """
-    exact_prefix = (
+    # Your S3 layout encodes selections in the path, including `model=<name>`.
+    base_prefix = (
         f"s3://{bucket}/predictions/"
         f"state_fips={state_fips}/"
         f"county_fips={county_fips}/"
@@ -382,76 +341,15 @@ def load_predictions_from_predictions_s3(
         f"run_date={run_date}/"
         f"model={model_name}/"
     )
-    run_date_prefix = (
-        f"s3://{bucket}/predictions/"
-        f"state_fips={state_fips}/"
-        f"county_fips={county_fips}/"
-        f"predict_year={int(predict_year)}/"
-        f"feature_season={feature_season}/"
-        f"run_date={run_date}/"
-    )
-    season_prefix = (
-        f"s3://{bucket}/predictions/"
-        f"state_fips={state_fips}/"
-        f"county_fips={county_fips}/"
-        f"predict_year={int(predict_year)}/"
-        f"feature_season={feature_season}/"
-    )
 
     dbg = {
-        "base_prefix": exact_prefix,
+        "base_prefix": base_prefix,
         "feature_season": feature_season,
         "run_date": run_date,
         "model_name": model_name,
-        "search_strategy": "exact",
     }
 
-    exts = (".parquet", ".parquet.out", ".csv", ".out")
-    files, exact_strategy = find_prediction_files_exact_first(
-        region=region,
-        bucket=bucket,
-        state_fips=state_fips,
-        county_fips=county_fips,
-        predict_year=int(predict_year),
-        feature_season=feature_season,
-        run_date=run_date,
-        model_name=model_name,
-    )
-    dbg["search_strategy"] = exact_strategy
-
-    def _norm_model(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", str(s).lower())
-
-    wanted_model_norm = _norm_model(model_name)
-
-    if not files:
-        broader = s3_list_files_under_prefix(region, run_date_prefix, exts=exts)
-        filtered = []
-        for f in broader:
-            if "/model=" in f:
-                model_in_path = f.split("/model=")[1].split("/")[0]
-                if _norm_model(model_in_path) == wanted_model_norm:
-                    filtered.append(f)
-        if filtered:
-            files = filtered
-            dbg["search_strategy"] = "run_date_fallback"
-            dbg["fallback_prefix"] = run_date_prefix
-
-    if not files:
-        broader = s3_list_files_under_prefix(region, season_prefix, exts=exts)
-        filtered = []
-        run_token = f"/run_date={run_date}/"
-        for f in broader:
-            if run_token not in f or "/model=" not in f:
-                continue
-            model_in_path = f.split("/model=")[1].split("/")[0]
-            if _norm_model(model_in_path) == wanted_model_norm:
-                filtered.append(f)
-        if filtered:
-            files = filtered
-            dbg["search_strategy"] = "season_fallback"
-            dbg["fallback_prefix"] = season_prefix
-
+    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".parquet.out", ".csv"))
     dbg["files_found"] = len(files)
     dbg["files_preview"] = files[:10]
 
@@ -464,18 +362,21 @@ def load_predictions_from_predictions_s3(
         try:
             dfs.append(_read_any_file(f))
         except Exception:
+            # Skip unreadable fragments rather than failing the whole demo
             continue
 
     if not dfs:
-        raise FileNotFoundError(f"Files exist but none were readable under: {exact_prefix}")
+        raise FileNotFoundError(f"Files exist but none were readable under: {base_prefix}")
 
     df = pd.concat(dfs, ignore_index=True)
     df = dedupe_columns(df)
 
+    # normalize key columns
     pred_col = _first_present(list(df.columns), PRED_COL_CANDIDATES)
     if pred_col and pred_col != "prediction":
         df = df.rename(columns={pred_col: "prediction"})
     if "prediction" not in df.columns:
+        # last-resort: if single numeric col, treat it as prediction
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if len(num_cols) == 1:
             df = df.rename(columns={num_cols[0]: "prediction"})
@@ -493,6 +394,7 @@ def load_predictions_from_predictions_s3(
     if year_col and year_col != "year":
         df = df.rename(columns={year_col: "year"})
 
+    # ensure year
     if "year" not in df.columns:
         df["year"] = int(predict_year)
     df["year"] = pd.to_numeric(df["year"], errors="coerce").fillna(int(predict_year)).astype(int)
@@ -510,6 +412,7 @@ def load_predictions_from_predictions_s3(
         df["county_norm"] = ""
         df["county_display"] = ""
 
+    # attach selection metadata for reporting
     df["feature_season"] = feature_season
     df["run_date"] = run_date
     df["model_name"] = model_name
@@ -617,55 +520,6 @@ def load_predictions_for_run_dates(
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
     # normalize
-    if "county_norm" in out.columns:
-        out["county_norm"] = out["county_norm"].astype(str)
-    if "year" in out.columns:
-        out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("int64")
-    return out
-
-
-SEASON_TO_MODEL = {
-    "jun01": "Jun01_LightGBM-limited_withstorm",
-    "jul01": "Jul01_LightGBM-limited_withstorm",
-    "aug01": "Aug01_LightGBM-limited_withstorm",
-}
-
-@st.cache_data(show_spinner=False)
-def load_predictions_for_seasons(
-    region: str,
-    bucket: str,
-    state_fips: str,
-    county_fips: str,
-    predict_year: int,
-    run_date_map: Dict[str, str],
-    seasons: List[str],
-) -> pd.DataFrame:
-    """Load one prediction set per season for the target year and attach season/model labels."""
-    frames = []
-    for season in seasons:
-        model_name = SEASON_TO_MODEL.get(season)
-        run_date = str(run_date_map.get(season, "")).strip()
-        if not model_name or not run_date:
-            continue
-        d, _ = load_predictions_from_predictions_s3(
-            region=region,
-            bucket=bucket,
-            state_fips=state_fips,
-            predict_year=int(predict_year),
-            feature_season=season,
-            run_date=run_date,
-            model_name=model_name,
-            county_fips=county_fips,
-        )
-        if d is None or d.empty:
-            continue
-        d = d.copy()
-        d["season_label"] = season.upper()
-        d["season_order"] = {"jun01": 1, "jul01": 2, "aug01": 3}.get(season, 99)
-        frames.append(d)
-    if not frames:
-        return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
     if "county_norm" in out.columns:
         out["county_norm"] = out["county_norm"].astype(str)
     if "year" in out.columns:
@@ -1103,11 +957,6 @@ with st.sidebar:
     default_model_index = model_options.index(default_model_name) if default_model_name in model_options else 0
     model_name = st.selectbox("Model name", options=model_options, index=default_model_index)
 
-    st.markdown("#### 2025 season comparison inputs")
-    compare_jun01_run_date = st.text_input("Jun01 run_date (2025 compare)", value=os.getenv("COMPARE_JUN01_RUN_DATE", "2025-06-01"))
-    compare_jul01_run_date = st.text_input("Jul01 run_date (2025 compare)", value=os.getenv("COMPARE_JUL01_RUN_DATE", "2025-07-01"))
-    compare_aug01_run_date = st.text_input("Aug01 run_date (2025 compare)", value=os.getenv("COMPARE_AUG01_RUN_DATE", "2025-08-01"))
-
     st.caption(f"Historical years 2019–2024 are fixed to baseline run_date: {baseline_run_date}")
 
     st.markdown("---")
@@ -1151,51 +1000,23 @@ def _load_all_years(
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], List[Dict]]:
     pred_all = []
     dbg_all = []
-
-    # If run_date is left blank in the UI, auto-pick the latest available run_date
-    # for the target year / selected season / selected model.
-    effective_target_run_date = str(run_date).strip()
-    if not effective_target_run_date:
-        try:
-            available_target_run_dates = list_available_run_dates_for_year(
-                region=region,
-                bucket=bucket,
-                state_fips=state_fips,
-                county_fips=county_fips,
-                predict_year=int(target_year),
-                feature_season=feature_season,
-                run_date_glob="*",
-                model_name=model_name,
-            )
-            if available_target_run_dates:
-                effective_target_run_date = sorted(available_target_run_dates)[-1]
-        except Exception:
-            effective_target_run_date = ""
-
     for y in years:
-        y = int(y)
-        # Historical years always use baseline; target year uses selected or inferred run_date.
-        rd = effective_target_run_date if y == int(target_year) else baseline_run_date
+        # Demo rule: for historical years (year < target_year) always read predictions from baseline_run_date
+        rd = run_date if int(y) == int(target_year) else baseline_run_date
         d, dbg = load_predictions_from_predictions_s3(
             region=region,
             bucket=bucket,
             state_fips=state_fips,
             county_fips=county_fips,
-            predict_year=y,
+            predict_year=int(y),
             feature_season=feature_season,
             run_date=rd,
             model_name=model_name,
         )
-        dbg["effective_run_date"] = rd
-        dbg["requested_predict_year"] = y
-        dbg["input_run_date"] = run_date
-        dbg["auto_inferred_target_run_date"] = (
-            effective_target_run_date if (y == int(target_year) and not str(run_date).strip()) else ""
-        )
         pred_all.append(d)
+        dbg["effective_run_date"] = rd
         dbg_all.append(dbg)
-
-    pred_all = pd.concat(pred_all, ignore_index=True) if pred_all else pd.DataFrame()
+    pred_all = pd.concat(pred_all, ignore_index=True)
 
     # actuals (optional but recommended)
     actuals_df = None
@@ -1297,59 +1118,8 @@ if actuals_df is not None and "year" in actuals_df.columns:
 
     title = f"Observed vs Mean Prediction — {(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {start_year}-{end_year}"
     if _HAS_PLOTLY:
-        season_compare_map = {
-            "jun01": compare_jun01_run_date,
-            "jul01": compare_jul01_run_date,
-            "aug01": compare_aug01_run_date,
-        }
-        season_compare_df = load_predictions_for_seasons(
-            region=region,
-            bucket=bucket,
-            state_fips=state_fips,
-            county_fips=county_fips,
-            predict_year=int(target_year),
-            run_date_map=season_compare_map,
-            seasons=["jun01", "jul01", "aug01"],
-        )
-
-        st.markdown("### 2025 seasonal comparison (Jun01 vs Jul01 vs Aug01)")
-        st.caption("Compares the selected county's 2025 prediction across the three seasonal models using the run_dates you provide in the sidebar.")
-
-        if season_compare_df.empty:
-            st.info("No season-comparison prediction files could be loaded for the provided Jun01/Jul01/Aug01 run_dates.")
-        else:
-            sc = season_compare_df.copy()
-            if county_selected != STATEWIDE_KEY:
-                sc = sc[sc["county_norm"] == county_selected].copy()
-            else:
-                sc = (
-                    sc.groupby(["season_label", "season_order"], as_index=False)["prediction"]
-                      .mean()
-                )
-            sc = sc.sort_values(["season_order", "season_label"]).copy()
-            if not sc.empty:
-                season_fig = go.Figure()
-                season_fig.add_trace(go.Scatter(
-                    x=sc["season_label"],
-                    y=sc["prediction"],
-                    mode="lines+markers",
-                    name=f"{int(target_year)} prediction",
-                    line=dict(width=3),
-                    marker=dict(size=10),
-                ))
-                season_fig.update_layout(
-                    title=f"{(STATEWIDE_LABEL if county_selected==STATEWIDE_KEY else county_selected.title())} — {int(target_year)} prediction across seasons",
-                    xaxis_title="Season model",
-                    yaxis_title="Predicted yield (bu/acre)",
-                    margin=dict(l=20, r=20, t=50, b=20),
-                )
-                st.plotly_chart(season_fig, use_container_width=True)
-                show_cols = [c for c in ["season_label", "prediction", "run_date", "model_name"] if c in sc.columns]
-                if not show_cols:
-                    show_cols = ["season_label", "prediction"]
-                st.dataframe(sc[show_cols], use_container_width=True)
-            else:
-                st.info("Selected county was not found in one or more of the seasonal prediction files.")
+        fig = plot_observed_vs_pred_plotly(series_df, title=title)
+        st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Install plotly for interactive charts: pip install plotly")
 
@@ -1388,11 +1158,11 @@ if actuals_df is not None and "year" in actuals_df.columns:
         st.info("Provide a State machine ARN in the sidebar to enable triggering.")
 
 
-st.markdown("#### C) 2025 run-date comparison")
-st.caption("Compare how the *2025* prediction changes across different run dates. Great to explain model stability and the impact of new live storm data.")
+st.markdown("#### C) 2025 run-date comparison (demo wow view)")
+st.caption("Compare how the *2025* prediction changes across different run dates. You can enter run_dates manually, discover them dynamically from S3, or use both.")
 
 compare_year = int(target_year)  # default 2025
-run_date_glob = st.text_input("Run-date pattern (glob)", value="*", help="Use '*' to find all run_dates, or '2026-03-*' to filter.")
+run_date_glob = st.text_input("Run-date pattern (glob)", value="*", help="Use '*' to discover run_dates dynamically from S3, or '2026-03-*' to filter.")
 available_rds = list_available_run_dates_for_year(
     region=region,
     bucket=bucket,
@@ -1404,49 +1174,70 @@ available_rds = list_available_run_dates_for_year(
     model_name=model_name,
 )
 
-if not available_rds:
-    st.info("No run_date folders found for the selected model/season/year in S3.")
+manual_rds_text = st.text_input(
+    "Enter run_dates manually (comma-separated)",
+    value="",
+    help="Example: 2025-05-20, 2025-05-25, 2025-05-30",
+)
+manual_rds = [x.strip() for x in manual_rds_text.split(",") if x.strip()]
+
+dynamic_default = available_rds[-min(5, len(available_rds)):] if available_rds else []
+use_dynamic_rds = st.checkbox(
+    "Also include dynamically discovered run_dates from S3",
+    value=bool(available_rds),
+)
+selected_dynamic_rds = []
+if use_dynamic_rds and available_rds:
+    selected_dynamic_rds = st.multiselect(
+        "Discovered run_dates",
+        options=available_rds,
+        default=dynamic_default,
+    )
+elif use_dynamic_rds and not available_rds:
+    st.info("No run_date folders were discovered from S3 for this season/model/year. You can still enter run_dates manually above.")
+
+selected_rds = []
+for rd in manual_rds + selected_dynamic_rds:
+    if rd not in selected_rds:
+        selected_rds.append(rd)
+
+if not selected_rds:
+    st.info("Enter one or more run_dates manually, or select discovered run_dates from S3.")
 else:
-    default_pick = available_rds[-min(5, len(available_rds)):]
-    selected_rds = st.multiselect("Select run_dates to compare", options=available_rds, default=default_pick)
+    pr = load_predictions_for_run_dates(
+        region=region,
+        bucket=bucket,
+        state_fips=state_fips,
+        county_fips=county_fips,
+        predict_year=compare_year,
+        feature_season=feature_season,
+        model_name=model_name,
+        run_dates=selected_rds,
+    )
 
-    if not selected_rds:
-        st.info("Select at least one run_date to compare.")
+    if pr.empty:
+        st.warning("No prediction files could be loaded for the selected run_dates.")
     else:
-        pr = load_predictions_for_run_dates(
-            region=region,
-            bucket=bucket,
-            state_fips=state_fips,
-            county_fips=county_fips,
-            predict_year=compare_year,
-            feature_season=feature_season,
-            model_name=model_name,
-            run_dates=selected_rds,
-        )
+        ckey = normalize_county(county_selected)
+        if "county_norm" in pr.columns:
+            pc = pr[pr["county_norm"] == ckey].copy()
+            pc["run_date"] = pd.to_datetime(pc["run_date"], errors="coerce")
+            pc = pc.sort_values("run_date")
 
-        if pr.empty:
-            st.warning("No prediction files could be loaded for the selected run_dates.")
-        else:
-            ckey = normalize_county(county_selected)
-            if "county_norm" in pr.columns:
-                pc = pr[pr["county_norm"] == ckey].copy()
-                pc["run_date"] = pd.to_datetime(pc["run_date"], errors="coerce")
-                pc = pc.sort_values("run_date")
+            if not pc.empty and _HAS_PLOTLY:
+                fig = px.line(pc, x="run_date", y="prediction", markers=True,
+                              title=f"{county_selected} — Prediction for {compare_year} across run_dates")
+                st.plotly_chart(fig, use_container_width=True)
+            elif pc.empty:
+                st.info("Selected county not found in loaded prediction files.")
 
-                if not pc.empty and _HAS_PLOTLY:
-                    fig = px.line(pc, x="run_date", y="prediction", markers=True,
-                                  title=f"{county_selected} — Prediction for {compare_year} across run_dates")
-                    st.plotly_chart(fig, use_container_width=True)
-                elif pc.empty:
-                    st.info("Selected county not found in loaded prediction files.")
+            st.markdown("**Selected run_dates**")
+            st.write(selected_rds)
 
-                # st.markdown("**Stability across counties** (Std Dev of prediction across run_dates)")
-                st.markdown("### Stability across counties (Std Dev of prediction across run_dates)")
-
-                st.info(
-                    "Stability analysis requires multiple run_dates. "
-                    "For this demo only a single run_date is available, so the stability view is disabled."
-                )
+            st.markdown("**Stability across counties** (Std Dev of prediction across run_dates)")
+            if len(selected_rds) < 2:
+                st.info("Stability analysis requires at least two run_dates.")
+            else:
                 stab = (
                     pr.groupby("county_norm", as_index=False)["prediction"]
                       .agg(std_pred="std", mean_pred="mean", min_pred="min", max_pred="max", n_runs="count")
@@ -1456,14 +1247,16 @@ else:
                 with colA:
                     st.dataframe(stab.head(15), use_container_width=True)
                 with colB:
-                    if _HAS_PLOTLY:
-                        figh = px.histogram(stab.dropna(), x="std_pred", nbins=20,
+                    if _HAS_PLOTLY and not stab.dropna(subset=["std_pred"]).empty:
+                        figh = px.histogram(stab.dropna(subset=["std_pred"]), x="std_pred", nbins=20,
                                             title="Distribution of stability (std dev across run_dates)")
                         st.plotly_chart(figh, use_container_width=True)
+                    else:
+                        st.info("Not enough valid values to render the stability histogram.")
 
                 st.caption("Demo tip: low std dev = stable counties; high std dev counties are sensitive to newly ingested storm/ERA5 signals.")
-            else:
-                st.info("Predictions missing county identifiers; run-date comparison disabled.")
+        else:
+            st.info("Predictions missing county identifiers; run-date comparison disabled.")
 
 with tab_debug:
     st.markdown("### Debug info (what was searched under predictions)")
@@ -1559,49 +1352,49 @@ with tab_valueadd:
     else:
         st.info("Predictions missing county identifiers; distribution view disabled.")
 
-    # st.markdown("#### B) Observed vs Predicted across counties (for a single year)")
-    # year_for_scatter = st.selectbox("Pick a year for accuracy scatter (needs actuals)", options=[y for y in years if int(y) <= 2024], index=0)
-    # if actuals_df is not None and "county_norm" in pred_all.columns and "county_norm" in actuals_df.columns:
-    #     py = prepare_county_year_frame(
-    #         pred_all[pred_all["year"] == int(year_for_scatter)],
-    #         county_col="county_display" if "county_display" in pred_all.columns else "county_norm",
-    #         year_col="year",
-    #         value_col="prediction",
-    #         value_name="pred",
-    #     )
-    #     ay = prepare_county_year_frame(
-    #         actuals_df[actuals_df["year"] == int(year_for_scatter)],
-    #         county_col="county_display" if "county_display" in actuals_df.columns else "county_norm",
-    #         year_col="year",
-    #         value_col="observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre",
-    #         value_name="obs",
-    #     )
-    #     m2 = py.merge(ay[["county_norm", "obs"]], on="county_norm", how="inner")
-    #     m2["county_display"] = m2["county_display"].fillna(m2["county_norm"].str.title())
-    #     pred_count = int(py["county_norm"].nunique())
-    #     act_count = int(ay["county_norm"].nunique())
-    #     overlap_count = int(m2["county_norm"].nunique())
-    #     missing_from_actuals = sorted(set(py["county_norm"]) - set(ay["county_norm"]))
-    #     missing_from_predictions = sorted(set(ay["county_norm"]) - set(py["county_norm"]))
-    #     if not m2.empty:
-    #         if _HAS_PLOTLY:
-    #             figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) - {year_for_scatter}")
-    #             st.plotly_chart(figs, use_container_width=True)
-    #         st.write({
-    #             "prediction_counties": pred_count,
-    #             "actual_counties": act_count,
-    #             "overlap_counties": overlap_count,
-    #             "RMSE": metric_rmse(m2["obs"], m2["pred"]),
-    #             "MAE": metric_mae(m2["obs"], m2["pred"]),
-    #             "R2": metric_r2(m2["obs"], m2["pred"]),
-    #         })
-    #         if pred_count != act_count or overlap_count != pred_count:
-    #             with st.expander("County overlap debug"):
-    #                 st.write({"missing_from_actuals": missing_from_actuals, "missing_from_predictions": missing_from_predictions})
-    #     else:
-    #         st.info("Not enough overlap between predictions and actuals for this year.")
-    # else:
-    #     st.info("Actuals or county keys missing; scatter view disabled.")
+    st.markdown("#### B) Observed vs Predicted across counties (for a single year)")
+    year_for_scatter = st.selectbox("Pick a year for accuracy scatter (needs actuals)", options=[y for y in years if int(y) <= 2024], index=0)
+    if actuals_df is not None and "county_norm" in pred_all.columns and "county_norm" in actuals_df.columns:
+        py = prepare_county_year_frame(
+            pred_all[pred_all["year"] == int(year_for_scatter)],
+            county_col="county_display" if "county_display" in pred_all.columns else "county_norm",
+            year_col="year",
+            value_col="prediction",
+            value_name="pred",
+        )
+        ay = prepare_county_year_frame(
+            actuals_df[actuals_df["year"] == int(year_for_scatter)],
+            county_col="county_display" if "county_display" in actuals_df.columns else "county_norm",
+            year_col="year",
+            value_col="observed_yield" if "observed_yield" in actuals_df.columns else "yield_bu_acre",
+            value_name="obs",
+        )
+        m2 = py.merge(ay[["county_norm", "obs"]], on="county_norm", how="inner")
+        m2["county_display"] = m2["county_display"].fillna(m2["county_norm"].str.title())
+        pred_count = int(py["county_norm"].nunique())
+        act_count = int(ay["county_norm"].nunique())
+        overlap_count = int(m2["county_norm"].nunique())
+        missing_from_actuals = sorted(set(py["county_norm"]) - set(ay["county_norm"]))
+        missing_from_predictions = sorted(set(ay["county_norm"]) - set(py["county_norm"]))
+        if not m2.empty:
+            if _HAS_PLOTLY:
+                figs = plot_obs_pred_scatter(m2, title=f"Observed vs Predicted (county-level) - {year_for_scatter}")
+                st.plotly_chart(figs, use_container_width=True)
+            st.write({
+                "prediction_counties": pred_count,
+                "actual_counties": act_count,
+                "overlap_counties": overlap_count,
+                "RMSE": metric_rmse(m2["obs"], m2["pred"]),
+                "MAE": metric_mae(m2["obs"], m2["pred"]),
+                "R2": metric_r2(m2["obs"], m2["pred"]),
+            })
+            if pred_count != act_count or overlap_count != pred_count:
+                with st.expander("County overlap debug"):
+                    st.write({"missing_from_actuals": missing_from_actuals, "missing_from_predictions": missing_from_predictions})
+        else:
+            st.info("Not enough overlap between predictions and actuals for this year.")
+    else:
+        st.info("Actuals or county keys missing; scatter view disabled.")
 
     if county_selected is None:
         st.stop()
