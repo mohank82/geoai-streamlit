@@ -277,7 +277,6 @@ def find_prediction_files_exact_first(
     run_date: str,
     model_name: str,
 ) -> Tuple[List[str], str]:
-    """Find prediction files robustly, even when the exact folder lookup is brittle."""
     base_prefix = (
         f"s3://{bucket}/predictions/"
         f"state_fips={state_fips}/"
@@ -295,47 +294,13 @@ def find_prediction_files_exact_first(
         base_prefix + "predictions.csv",
         base_prefix + "part.csv",
     ]
-    exact_found = [u for u in exact_candidates if s3_object_exists(region, u)]
+    exact_found = [p for p in exact_candidates if s3_object_exists(region, p)]
     if exact_found:
-        return sorted(set(exact_found)), "exact_file_probe"
+        return exact_found, "exact_file_probe"
 
-    exts = (".parquet", ".parquet.out", ".csv", ".out")
-    files = s3_list_files_under_prefix(region, base_prefix, exts=exts)
+    files = s3_list_files_under_prefix(region, base_prefix, exts=(".parquet", ".parquet.out", ".csv", ".out"))
     if files:
-        return sorted(set(files)), "prefix_list"
-
-    # Broad fallback: search at predict_year level and filter by season/run_date/model tokens.
-    broad_prefix = (
-        f"s3://{bucket}/predictions/"
-        f"state_fips={state_fips}/"
-        f"county_fips={county_fips}/"
-        f"predict_year={int(predict_year)}/"
-    )
-    try:
-        broader = s3_list_files_under_prefix(region, broad_prefix, exts=exts)
-    except Exception:
-        broader = []
-
-    def _norm_model(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", str(s).lower())
-
-    wanted_model_norm = _norm_model(model_name)
-    run_token = f"/run_date={run_date}/"
-    season_token = f"/feature_season={feature_season}/"
-    filtered: List[str] = []
-    for f in broader:
-        if season_token not in f or run_token not in f or "/model=" not in f:
-            continue
-        model_in_path = f.split("/model=")[1].split("/")[0]
-        if _norm_model(model_in_path) == wanted_model_norm:
-            filtered.append(f)
-    if filtered:
-        return sorted(set(filtered)), "predict_year_broad_fallback"
-
-    # Last resort: return any files for the exact run_date+season under the year.
-    relaxed = [f for f in broader if season_token in f and run_token in f]
-    if relaxed:
-        return sorted(set(relaxed)), "predict_year_relaxed_fallback"
+        return files, "prefix_list"
 
     return [], "not_found"
 
@@ -1132,23 +1097,51 @@ def _load_all_years(
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], List[Dict]]:
     pred_all = []
     dbg_all = []
+
+    # If run_date is left blank in the UI, auto-pick the latest available run_date
+    # for the target year / selected season / selected model.
+    effective_target_run_date = str(run_date).strip()
+    if not effective_target_run_date:
+        try:
+            available_target_run_dates = list_available_run_dates_for_year(
+                region=region,
+                bucket=bucket,
+                state_fips=state_fips,
+                county_fips=county_fips,
+                predict_year=int(target_year),
+                feature_season=feature_season,
+                run_date_glob="*",
+                model_name=model_name,
+            )
+            if available_target_run_dates:
+                effective_target_run_date = sorted(available_target_run_dates)[-1]
+        except Exception:
+            effective_target_run_date = ""
+
     for y in years:
-        # Demo rule: for historical years (year < target_year) always read predictions from baseline_run_date
-        rd = run_date if int(y) == int(target_year) else baseline_run_date
+        y = int(y)
+        # Historical years always use baseline; target year uses selected or inferred run_date.
+        rd = effective_target_run_date if y == int(target_year) else baseline_run_date
         d, dbg = load_predictions_from_predictions_s3(
             region=region,
             bucket=bucket,
             state_fips=state_fips,
             county_fips=county_fips,
-            predict_year=int(y),
+            predict_year=y,
             feature_season=feature_season,
             run_date=rd,
             model_name=model_name,
         )
-        pred_all.append(d)
         dbg["effective_run_date"] = rd
+        dbg["requested_predict_year"] = y
+        dbg["input_run_date"] = run_date
+        dbg["auto_inferred_target_run_date"] = (
+            effective_target_run_date if (y == int(target_year) and not str(run_date).strip()) else ""
+        )
+        pred_all.append(d)
         dbg_all.append(dbg)
-    pred_all = pd.concat(pred_all, ignore_index=True)
+
+    pred_all = pd.concat(pred_all, ignore_index=True) if pred_all else pd.DataFrame()
 
     # actuals (optional but recommended)
     actuals_df = None
