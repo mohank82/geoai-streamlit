@@ -1607,26 +1607,45 @@ with tab_valueadd:
                                     stab_display[["std_pred", "mean_pred", "min_pred", "max_pred"]].round(3)
                                 )
 
+                                # Streamlit's interactive dataframe can throw a frontend React error
+                                # for some sparse/mixed combinations here, so render a plain table instead.
+                                stab_display = stab_display.astype({"county_norm": "string"}).fillna("")
+                                stab_display_records = [
+                                    {
+                                        "county_norm": str(r["county_norm"]),
+                                        "std_pred": float(r["std_pred"]),
+                                        "mean_pred": float(r["mean_pred"]),
+                                        "min_pred": float(r["min_pred"]),
+                                        "max_pred": float(r["max_pred"]),
+                                        "n_runs": int(r["n_runs"]),
+                                    }
+                                    for _, r in stab_display.iterrows()
+                                ]
+
                                 colA, colB = st.columns(2)
 
                                 with colA:
-                                    st.dataframe(stab_display, use_container_width=True, hide_index=True)
+                                    st.table(pd.DataFrame(stab_display_records))
 
                                 with colB:
                                     hist_df = stab[np.isfinite(stab["std_pred"])].copy()
                                     if _HAS_PLOTLY and not hist_df.empty and hist_df["std_pred"].notna().any():
-                                        figh = px.histogram(
-                                            hist_df,
-                                            x="std_pred",
-                                            nbins=min(20, max(5, hist_df["std_pred"].nunique())),
-                                            title="Distribution of stability (std dev across run dates)"
-                                        )
-                                        figh.update_layout(
-                                            xaxis_title="Std Dev of Prediction",
-                                            yaxis_title="County Count",
-                                            margin=dict(l=20, r=20, t=50, b=20),
-                                        )
-                                        st.plotly_chart(figh, use_container_width=True)
+                                        hist_unique = int(hist_df["std_pred"].nunique())
+                                        if hist_unique <= 1:
+                                            st.info("All counties have the same stability for this run-date combination.")
+                                        else:
+                                            figh = px.histogram(
+                                                hist_df,
+                                                x="std_pred",
+                                                nbins=min(20, max(5, hist_unique)),
+                                                title="Distribution of stability (std dev across run dates)"
+                                            )
+                                            figh.update_layout(
+                                                xaxis_title="Std Dev of Prediction",
+                                                yaxis_title="County Count",
+                                                margin=dict(l=20, r=20, t=50, b=20),
+                                            )
+                                            st.plotly_chart(figh, use_container_width=True)
                                     else:
                                         st.info("Not enough valid variation to draw the stability histogram.")
 
