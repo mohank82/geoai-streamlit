@@ -1535,47 +1535,106 @@ with tab_valueadd:
             if pr.empty:
                 st.warning("No prediction files could be loaded for the selected run_dates.")
             else:
-                ckey = normalize_county(county_selected)
-                if "county_norm" in pr.columns:
-                    pc = pr[pr["county_norm"] == ckey].copy()
-                    pc["run_date"] = pd.to_datetime(pc["run_date"], errors="coerce")
-                    pc = pc.sort_values("run_date")
+                pr = pr.copy()
+                pr["prediction"] = pd.to_numeric(pr["prediction"], errors="coerce")
+                pr = pr[pr["prediction"].notna()].copy()
 
-                    if not pc.empty and _HAS_PLOTLY:
-                        fig = px.line(
-                            pc,
-                            x="run_date",
-                            y="prediction",
-                            markers=True,
-                            title=f"{county_selected.title() if county_selected != STATEWIDE_KEY else STATEWIDE_LABEL} — Prediction for {compare_year} across run dates"
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                    elif pc.empty:
-                        st.info("Selected county not found in loaded prediction files.")
-
-                    st.markdown("**Stability across counties**")
-                    stab = (
-                        pr.groupby("county_norm", as_index=False)["prediction"]
-                        .agg(std_pred="std", mean_pred="mean", min_pred="min", max_pred="max", n_runs="count")
-                        .sort_values("std_pred", ascending=False)
-                    )
-
-                    colA, colB = st.columns(2)
-                    with colA:
-                        st.dataframe(stab.head(15), use_container_width=True)
-                    with colB:
-                        if _HAS_PLOTLY:
-                            figh = px.histogram(
-                                stab.dropna(),
-                                x="std_pred",
-                                nbins=20,
-                                title="Distribution of stability (std dev across run dates)"
-                            )
-                            st.plotly_chart(figh, use_container_width=True)
-
-                    st.caption("Low standard deviation indicates stable counties; higher deviation suggests stronger sensitivity to newly ingested weather signals.")
+                if pr.empty:
+                    st.info("Loaded files did not contain usable numeric prediction values.")
                 else:
-                    st.info("Predictions missing county identifiers; run-date comparison disabled.")
+                    ckey = normalize_county(county_selected)
+                    if "county_norm" in pr.columns:
+                        pc = pr[pr["county_norm"] == ckey].copy()
+                        pc["run_date"] = pd.to_datetime(pc["run_date"], errors="coerce")
+                        pc = pc.sort_values("run_date")
+
+                        if not pc.empty and _HAS_PLOTLY:
+                            fig = px.line(
+                                pc,
+                                x="run_date",
+                                y="prediction",
+                                markers=True,
+                                title=f"{county_selected.title() if county_selected != STATEWIDE_KEY else STATEWIDE_LABEL} — Prediction for {compare_year} across run dates"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        elif pc.empty:
+                            st.info("Selected county not found in loaded prediction files.")
+
+                        st.markdown("**Stability across counties**")
+
+                        stab_src = pr.copy()
+                        stab_src["prediction"] = pd.to_numeric(stab_src["prediction"], errors="coerce")
+                        stab_src["county_norm"] = stab_src["county_norm"].astype(str)
+                        stab_src = stab_src[
+                            stab_src["county_norm"].notna() &
+                            (stab_src["county_norm"].str.strip() != "") &
+                            stab_src["prediction"].notna()
+                        ].copy()
+
+                        if stab_src.empty:
+                            st.info("No valid county-level prediction values available for stability analysis.")
+                        else:
+                            stab = (
+                                stab_src.groupby("county_norm", as_index=False)["prediction"]
+                                .agg(
+                                    std_pred="std",
+                                    mean_pred="mean",
+                                    min_pred="min",
+                                    max_pred="max",
+                                    n_runs="count",
+                                )
+                                .copy()
+                            )
+
+                            stab["std_pred"] = pd.to_numeric(stab["std_pred"], errors="coerce").fillna(0.0)
+                            stab["mean_pred"] = pd.to_numeric(stab["mean_pred"], errors="coerce")
+                            stab["min_pred"] = pd.to_numeric(stab["min_pred"], errors="coerce")
+                            stab["max_pred"] = pd.to_numeric(stab["max_pred"], errors="coerce")
+                            stab["n_runs"] = pd.to_numeric(stab["n_runs"], errors="coerce").fillna(0).astype(int)
+
+                            for c in ["std_pred", "mean_pred", "min_pred", "max_pred"]:
+                                stab.loc[~np.isfinite(stab[c]), c] = np.nan
+
+                            stab = stab.dropna(subset=["mean_pred"]).sort_values(
+                                ["std_pred", "county_norm"], ascending=[False, True]
+                            ).reset_index(drop=True)
+
+                            if stab.empty:
+                                st.info("No stable county summary could be generated for the selected run-date combination.")
+                            else:
+                                stab_display = stab.head(15).copy()
+                                stab_display[["std_pred", "mean_pred", "min_pred", "max_pred"]] = (
+                                    stab_display[["std_pred", "mean_pred", "min_pred", "max_pred"]].round(3)
+                                )
+
+                                colA, colB = st.columns(2)
+
+                                with colA:
+                                    st.dataframe(stab_display, use_container_width=True, hide_index=True)
+
+                                with colB:
+                                    hist_df = stab[np.isfinite(stab["std_pred"])].copy()
+                                    if _HAS_PLOTLY and not hist_df.empty and hist_df["std_pred"].notna().any():
+                                        figh = px.histogram(
+                                            hist_df,
+                                            x="std_pred",
+                                            nbins=min(20, max(5, hist_df["std_pred"].nunique())),
+                                            title="Distribution of stability (std dev across run dates)"
+                                        )
+                                        figh.update_layout(
+                                            xaxis_title="Std Dev of Prediction",
+                                            yaxis_title="County Count",
+                                            margin=dict(l=20, r=20, t=50, b=20),
+                                        )
+                                        st.plotly_chart(figh, use_container_width=True)
+                                    else:
+                                        st.info("Not enough valid variation to draw the stability histogram.")
+
+                                st.caption(
+                                    "Low standard deviation indicates stable counties; higher deviation suggests stronger sensitivity to newly ingested weather signals."
+                                )
+                    else:
+                        st.info("Predictions missing county identifiers; run-date comparison disabled.")
 
     st.markdown("#### A) Distribution across counties (Predicted)")
     year_for_dist = st.selectbox("Pick a year for distribution view", options=years, index=len(years) - 1)
